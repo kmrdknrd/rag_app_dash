@@ -52,7 +52,7 @@ Choose from 4 different prompt types with varying knowledge constraints:
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/kmrdknrd/rag_app_dash.git
-   cd dash_rag_app
+   cd rag_app_dash
    ```
 
 2. **Install dependencies:**
