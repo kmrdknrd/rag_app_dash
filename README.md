@@ -70,7 +70,7 @@ Choose from 4 different prompt types with varying knowledge constraints:
 
 4. **Run the application:**
    ```bash
-   python app_six.py
+   python app.py
    ```
 
 5. **Open your browser:**
