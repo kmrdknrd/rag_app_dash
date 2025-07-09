@@ -1,3 +1,7 @@
 /docs_md
 /docs_pdf
 /embeddings
+/projects
+/__pycache__
+.DS_Store
+app_log.txt

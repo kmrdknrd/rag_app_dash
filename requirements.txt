@@ -18,3 +18,4 @@ tqdm>=4.65.0
 natsort>=8.4.0
 requests>=2.31.0
 difflib2>=0.1.0
+openai>=1.0.0

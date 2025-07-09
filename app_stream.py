@@ -10,6 +10,8 @@ import tempfile
 import uuid
 import logging
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from html.parser import HTMLParser
@@ -270,6 +272,85 @@ def build_openai_conversation_history(messages_json, max_turns=8):
         return openai_messages
     except:
         return []
+
+def stream_openai_response(messages, model_name, client, message_id):
+    """Stream OpenAI response and store chunks in global state"""
+    global streaming_state
+    
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            stream=True,
+            max_tokens=1024
+        )
+        
+        with streaming_state['lock']:
+            streaming_state['chunks'] = []
+            streaming_state['active'] = True
+            streaming_state['message_id'] = message_id
+            streaming_state['complete'] = False
+            streaming_state['error'] = None
+        
+        full_response = ""
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_response += content
+                
+                with streaming_state['lock']:
+                    streaming_state['chunks'].append(content)
+        
+        with streaming_state['lock']:
+            streaming_state['complete'] = True
+            streaming_state['active'] = False
+            
+        return full_response
+        
+    except Exception as e:
+        with streaming_state['lock']:
+            streaming_state['error'] = str(e)
+            streaming_state['complete'] = True
+            streaming_state['active'] = False
+        return ""
+
+def stream_gemini_response(prompt, model_name, client, message_id):
+    """Stream Gemini response and store chunks in global state"""
+    global streaming_state
+    
+    try:
+        response = client.generate_content(
+            prompt,
+            stream=True
+        )
+        
+        with streaming_state['lock']:
+            streaming_state['chunks'] = []
+            streaming_state['active'] = True
+            streaming_state['message_id'] = message_id
+            streaming_state['complete'] = False
+            streaming_state['error'] = None
+        
+        full_response = ""
+        for chunk in response:
+            if chunk.text:
+                full_response += chunk.text
+                
+                with streaming_state['lock']:
+                    streaming_state['chunks'].append(chunk.text)
+        
+        with streaming_state['lock']:
+            streaming_state['complete'] = True
+            streaming_state['active'] = False
+            
+        return full_response
+        
+    except Exception as e:
+        with streaming_state['lock']:
+            streaming_state['error'] = str(e)
+            streaming_state['complete'] = True
+            streaming_state['active'] = False
+        return ""
 
 class PdfProcessor:
     def __init__(self, converter="docling"):
@@ -627,24 +708,32 @@ session_data = {
     'conversation_mode': 'single'  # Default conversation mode (single/multi)
 }
 
+# Global state for streaming responses
+streaming_state = {
+    'active': False,
+    'message_id': None,
+    'chunks': [],
+    'complete': False,
+    'error': None,
+    'thread': None,
+    'lock': threading.Lock()
+}
+
 
 # Startup message
-startup_message = f"""Naudojatės 8devices RAG Chatbot (v.0.4.0).
+startup_message = f"""Naudojatės 8devices RAG Chatbot (v.0.2.0).
 Turėkit omeny, kad ši aplikacija yra alfa versijoje, ir yra greitai atnaujinama. Dabartinis tikslas yra parodyti, kaip galima naudoti Retrieval-Augmented Generation (RAG) su PDF dokumentais, kad praturtinti LLM atsakymus. Visi modeliai yra lokalūs, ir dokumentai yra išsaugomi jūsų kompiuteryje, tad jūsų duomenys nėra perduodami jokiam serveriui. Dėl to, ši aplikacija veikia lėtai.
 
 NAUJA: 
-- Projektų Valdymo Sistema - Pilnas skirtingų projektų palaikymas su projektams specifinėmis dokumentų saugyklomis
-- Google Gemini Integracija - Pilnas Gemini 2.5 Pro, Flash ir Flash-Lite modelių palaikymas
-- Pokalbių Režimai - Signle-turn ir Multi-turn pokalbių palaikymas.
-- Projektui Prisitaikantis Dokumentų Susiejimas - Spustelėjamos PDF nuorodos su projektui specifiniais URL
-- Dinaminio HTML Turinio Atvaizdavimas - Pilnas paryškinto teksto ir formatuoto turinio palaikymas
+- Kurti skirtingus projektus (pvz., 'Academic', 'Work'), kad atskirai organizuoti savo dokumentus.
+- Hyperlinks į naudotus šaltinius LLM atsakymuose.
+- OpenAI modeliai
 
 Jei turite kokių nors pastabų, galite jas pateikti adresu: konradas.m@8devices.com
 
 Greitai:
 - Hyperlinks į konkrečius puslapius LLM atsakymuose naudotuose šaltiniuose
 - Įkelti PDF dokumentus į saugią duomenų bazę, o ne į atmintį
-- LLM atsakymų streaming
 """
 startup_success = True
 
@@ -652,7 +741,7 @@ startup_success = True
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
-            html.H1("8devices RAG Chatbot (v.0.4.0)", className="text-center mb-2 mt-2"),
+            html.H1("8devices RAG Chatbot (v.0.2.0)", className="text-center mb-4"),
             html.Hr()
         ])
     ]),
@@ -662,24 +751,14 @@ app.layout = dbc.Container([
         dbc.Col([
             html.Div(id='system-status', children=[
                 dbc.Alert([
-                    dbc.Row([
-                        dbc.Col([
-                            html.Pre(startup_message, style={
-                                "whiteSpace": "pre-wrap",
-                                "margin": "0",
-                                "fontFamily": "inherit",
-                                "fontSize": "inherit"
-                            })
-                        ], width=11),
-                        dbc.Col([
-                            dbc.Button("×", id="close-startup-message", 
-                                     size="sm", color="link", 
-                                     className="text-muted p-0 float-end",
-                                     style={"fontSize": "1.2rem", "textDecoration": "none"})
-                        ], width=1, className="text-end")
-                    ], className="align-items-start")
+                    html.Pre(startup_message, style={
+                        "whiteSpace": "pre-wrap",
+                        "margin": "0",
+                        "fontFamily": "inherit",
+                        "fontSize": "inherit"
+                    })
                 ], color="success" if startup_success else "info",
-                   className="mb-3", id="startup-message-alert")
+                   className="mb-3")
             ])
         ])
     ]),
@@ -974,8 +1053,14 @@ app.layout = dbc.Container([
     # Hidden store for project data
     dcc.Store(id='project-data', data={'projects': [], 'current_project': None}),
     
+    # Hidden store for streaming state
+    dcc.Store(id='streaming-store', data={'active': False, 'message_id': None, 'content': ''}),
+    
     # Auto-refresh interval for log display
     dcc.Interval(id="log-interval", interval=1000, n_intervals=0),
+    
+    # Streaming interval for real-time response updates
+    dcc.Interval(id="streaming-interval", interval=200, n_intervals=0, disabled=True),
     
     # Modal for viewing prompt format
     dbc.Modal([
@@ -1118,17 +1203,6 @@ app.layout = dbc.Container([
     ], id="rag-config-modal", size="lg", is_open=False)
     
 ], fluid=True)
-
-# Callback to close startup message
-@app.callback(
-    Output('startup-message-alert', 'style'),
-    Input('close-startup-message', 'n_clicks'),
-    prevent_initial_call=True
-)
-def close_startup_message(n_clicks):
-    if n_clicks and n_clicks > 0:
-        return {'display': 'none'}
-    return {'display': 'block'}
 
 # Callback to initialize project list on app startup
 @app.callback(
@@ -2243,21 +2317,46 @@ def handle_chat(n_clicks, n_submit, user_input, messages_json, processing_state,
                     # Add current user query
                     messages.append({"role": "user", "content": user_input})
                     
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        max_tokens=1024,
-                        n=1
-                    )
+                    # Generate unique message ID for streaming
+                    message_id = str(uuid.uuid4())
+                    
+                    # Start streaming in a separate thread
+                    def stream_worker():
+                        return stream_openai_response(messages, model_name, client, message_id)
+                    
+                    streaming_thread = threading.Thread(target=stream_worker)
+                    streaming_thread.daemon = True
+                    streaming_thread.start()
+                    
+                    # Wait for streaming to complete
+                    streaming_thread.join()
+                    
+                    # Get final response
+                    with streaming_state['lock']:
+                        response_content = ''.join(streaming_state['chunks'])
+                        if streaming_state['error']:
+                            response_content = f"Error: {streaming_state['error']}"
                 else:
                     # Single-turn mode - use the current format
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "user", "content": rag_prompt}],
-                        max_tokens=1024,
-                        n=1
-                    )
-                response_content = response.choices[0].message.content.strip()
+                    # Generate unique message ID for streaming
+                    message_id = str(uuid.uuid4())
+                    
+                    # Start streaming in a separate thread
+                    def stream_worker():
+                        return stream_openai_response([{"role": "user", "content": rag_prompt}], model_name, client, message_id)
+                    
+                    streaming_thread = threading.Thread(target=stream_worker)
+                    streaming_thread.daemon = True
+                    streaming_thread.start()
+                    
+                    # Wait for streaming to complete
+                    streaming_thread.join()
+                    
+                    # Get final response
+                    with streaming_state['lock']:
+                        response_content = ''.join(streaming_state['chunks'])
+                        if streaming_state['error']:
+                            response_content = f"Error: {streaming_state['error']}"
                 current_project = session_data.get('current_project', 'default')
                 
                 # Handle both old and new document reference formats
@@ -2280,8 +2379,26 @@ def handle_chat(n_clicks, n_submit, user_input, messages_json, processing_state,
                 print(response_content)
             elif session_data['llm'] == 'gemini':
                 client = session_data['llm_client']
-                response = client.generate_content(rag_prompt)
-                response_content = response.text.strip()
+                
+                # Generate unique message ID for streaming
+                message_id = str(uuid.uuid4())
+                
+                # Start streaming in a separate thread
+                def stream_worker():
+                    return stream_gemini_response(rag_prompt, session_data['llm_config']['model_name'], client, message_id)
+                
+                streaming_thread = threading.Thread(target=stream_worker)
+                streaming_thread.daemon = True
+                streaming_thread.start()
+                
+                # Wait for streaming to complete
+                streaming_thread.join()
+                
+                # Get final response
+                with streaming_state['lock']:
+                    response_content = ''.join(streaming_state['chunks'])
+                    if streaming_state['error']:
+                        response_content = f"Error: {streaming_state['error']}"
                 current_project = session_data.get('current_project', 'default')
                 
                 # Handle both old and new document reference formats
@@ -2378,26 +2495,69 @@ def handle_chat(n_clicks, n_submit, user_input, messages_json, processing_state,
                     # Add current user query
                     messages.append({"role": "user", "content": user_input})
                     
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        max_tokens=1024,
-                        n=1
-                    )
+                    # Generate unique message ID for streaming
+                    message_id = str(uuid.uuid4())
+                    
+                    # Start streaming in a separate thread
+                    def stream_worker():
+                        return stream_openai_response(messages, model_name, client, message_id)
+                    
+                    streaming_thread = threading.Thread(target=stream_worker)
+                    streaming_thread.daemon = True
+                    streaming_thread.start()
+                    
+                    # Wait for streaming to complete
+                    streaming_thread.join()
+                    
+                    # Get final response
+                    with streaming_state['lock']:
+                        response_content = ''.join(streaming_state['chunks'])
+                        if streaming_state['error']:
+                            response_content = f"Error: {streaming_state['error']}"
                 else:
                     # Single-turn mode - use the current format
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "user", "content": chat_prompt}],
-                        max_tokens=1024,
-                        n=1
-                    )
-                response_content = response.choices[0].message.content.strip()
+                    # Generate unique message ID for streaming
+                    message_id = str(uuid.uuid4())
+                    
+                    # Start streaming in a separate thread
+                    def stream_worker():
+                        return stream_openai_response([{"role": "user", "content": chat_prompt}], model_name, client, message_id)
+                    
+                    streaming_thread = threading.Thread(target=stream_worker)
+                    streaming_thread.daemon = True
+                    streaming_thread.start()
+                    
+                    # Wait for streaming to complete
+                    streaming_thread.join()
+                    
+                    # Get final response
+                    with streaming_state['lock']:
+                        response_content = ''.join(streaming_state['chunks'])
+                        if streaming_state['error']:
+                            response_content = f"Error: {streaming_state['error']}"
             elif session_data['llm'] == 'gemini':
                 client = session_data['llm_client']
                 # Gemini uses the text-based conversation history format
-                response = client.generate_content(chat_prompt)
-                response_content = response.text.strip()
+                
+                # Generate unique message ID for streaming
+                message_id = str(uuid.uuid4())
+                
+                # Start streaming in a separate thread
+                def stream_worker():
+                    return stream_gemini_response(chat_prompt, session_data['llm_config']['model_name'], client, message_id)
+                
+                streaming_thread = threading.Thread(target=stream_worker)
+                streaming_thread.daemon = True
+                streaming_thread.start()
+                
+                # Wait for streaming to complete
+                streaming_thread.join()
+                
+                # Get final response
+                with streaming_state['lock']:
+                    response_content = ''.join(streaming_state['chunks'])
+                    if streaming_state['error']:
+                        response_content = f"Error: {streaming_state['error']}"
             else:
                 response = session_data['llm'].invoke(chat_prompt)
                 response_content = response.content.split("</think>")[1] if "</think>" in response.content else response.content
