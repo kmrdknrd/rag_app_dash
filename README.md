@@ -92,7 +92,7 @@ Choose from 4 different prompt types with varying knowledge constraints:
 
 4. **Run the application:**
    ```bash
-   python app_projects.py
+   python app.py
    ```
 
 5. **Open your browser:**
@@ -254,7 +254,7 @@ The modular design allows easy extension of:
 - New cloud model providers
 
 ### Key Files
-- `app_projects.py` - Main application file
+- `app.py` - Main application file
 - `CLAUDE.md` - Development guidelines and architecture documentation
 - `app_log.txt` - Application logs
 - `projects/` - Project data storage
