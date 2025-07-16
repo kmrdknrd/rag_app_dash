@@ -1,6 +1,6 @@
-# 8devices RAG Chatbot (v.0.2.0)
+# 8devices RAG Chatbot (v.0.4.1)
 
-A powerful Retrieval-Augmented Generation (RAG) chatbot application built with Dash that allows users to upload PDF documents and ask questions about them using local AI models or cloud APIs. Features complete project management, multi-model support, and enhanced conversational capabilities.
+A powerful Retrieval-Augmented Generation (RAG) chatbot application built with Dash that allows users to upload PDF documents and ask questions about them using local AI models or cloud APIs. Features complete project management, multi-model support, enhanced conversational capabilities, comprehensive usage analytics, and advanced progress tracking.
 
 ## Features
 
@@ -22,6 +22,8 @@ A powerful Retrieval-Augmented Generation (RAG) chatbot application built with D
 - Smart document chunking with configurable parameters
 - Project-specific document processing and resume functionality
 - Enhanced file validation and error handling
+- Multi-stage progress tracking with detailed status updates
+- Resume functionality for incomplete document processing
 
 ### 🧠 **Enhanced RAG Pipeline**
 - **Bi-encoder retrieval** using Snowflake Arctic or BGE-M3 models
@@ -45,6 +47,8 @@ Choose from 4 different prompt types with varying knowledge constraints:
 - **Enhanced content rendering** with clickable links and formatting
 - **Live processing log** to monitor system operations
 - **Document reference citations** with clickable PDF links
+- **Dynamic content parsing** with HTML link rendering and text formatting
+- **Personal usage analytics** tracking queries, responses, and performance metrics
 
 ### 🤖 **Multi-Model Support**
 - **Local Ollama models** (privacy-focused)
@@ -59,6 +63,20 @@ Choose from 4 different prompt types with varying knowledge constraints:
 - Configurable chunking and retrieval parameters
 - Conversation mode selection
 - Prompt format preview functionality
+- Real-time configuration updates without restart
+- Dynamic UI adaptation based on selected models
+
+### 📊 **Comprehensive Analytics & Tracking**
+- **Personal usage statistics** with detailed query and response metrics
+- **Progress tracking system** with multi-stage processing updates
+- **Error tracking** across all operations with categorized reporting
+- **Performance monitoring** for embeddings, responses, and document processing
+- **Session analytics** including duration, queries per session, and real-time updates
+- **Model usage tracking** comparing API vs local usage patterns
+
+### 🔧 **Enhanced Development Features**
+- **Comprehensive logging** with file-based logs and UI integration
+- **GPU acceleration support** (MPS on macOS) for faster processing
 
 ## Installation
 
@@ -78,10 +96,11 @@ Choose from 4 different prompt types with varying knowledge constraints:
 
 2. **Install dependencies:**
    ```bash
+   conda create -n rag_app python=3.10 pip
    pip install -r requirements.txt
    ```
 
-3. **Install and start Ollama (for local models):**
+3. **Install and start Ollama (for local models; skip if you only want to use cloud models):**
    ```bash
    # Install Ollama (visit https://ollama.ai for platform-specific instructions)
    
@@ -96,7 +115,7 @@ Choose from 4 different prompt types with varying knowledge constraints:
    ```
 
 5. **Open your browser:**
-   Navigate to `http://localhost:8061`
+   Navigate to `http://localhost:8050-8100` (automatic port allocation)
 
 ## Usage
 
@@ -265,16 +284,37 @@ This project is in active development. For feedback and contributions, contact: 
 
 ## Changelog
 
-### v0.2.0 (Current)
+### v0.4.1 (Current)
+- **NEW**: Multi-user support through automatic port allocation system (ports 8050-8100)
+- **NEW**: Enhanced port management with automatic conflict resolution
+- **NEW**: Port logging and tracking for multiple concurrent app instances
+- **NEW**: Automatic cleanup of port allocations when applications exit
+- **NEW**: Comprehensive personal usage analytics and statistics tracking
+- **NEW**: Advanced progress tracking system with multi-stage processing updates
+- **NEW**: Enhanced error tracking and categorized reporting across all operations
+- **NEW**: Session analytics with duration and query tracking
+- **NEW**: Model usage comparison between API and local usage
+- **IMPROVED**: Better application startup with dynamic port selection
+- **IMPROVED**: Enhanced error handling for port conflicts
+- **IMPROVED**: Better user experience with automatic port management
+- **IMPROVED**: Better file-based logging with UI integration
+- **IMPROVED**: Optimized performance monitoring for all operations
+
+### v0.4.0
 - **NEW**: Complete project management system
 - **NEW**: Google Gemini model integration
 - **NEW**: Multi-turn conversation support
 - **NEW**: Enhanced HTML content rendering
 - **NEW**: Project-aware document linking
 - **NEW**: File-based logging system
+- **IMPROVED**: Enhanced content parsing with HTML link rendering
+- **IMPROVED**: Dynamic UI adaptation based on selected models
+- **IMPROVED**: Real-time configuration updates without application restart
 - **IMPROVED**: Better error handling and recovery
 - **IMPROVED**: Enhanced UI with dynamic controls
 - **IMPROVED**: Optimized memory management
+
+### v0.2.0-v0.3.0 got skipped
 
 ### v0.1.0
 - Initial release with basic RAG functionality
