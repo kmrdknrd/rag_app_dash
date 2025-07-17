@@ -1115,7 +1115,7 @@ session_data = {
 }
 
 # Startup message
-startup_message = f"""Naudojatės 8devices RAG Chatbot (v.0.4.1).
+startup_message = f"""Naudojatės 8devices RAG Chatbot (v0.4.2).
 Turėkit omeny, kad ši aplikacija yra alfa versijoje, ir yra greitai atnaujinama. Dabartinis tikslas yra parodyti, kaip galima naudoti Retrieval-Augmented Generation (RAG) su PDF dokumentais, kad praturtinti LLM atsakymus. Visi modeliai yra lokalūs, ir dokumentai yra išsaugomi jūsų kompiuteryje, tad jūsų duomenys nėra perduodami jokiam serveriui. Dėl to, ši aplikacija veikia lėtai.
 
 NAUJA:
@@ -1146,7 +1146,7 @@ startup_success = True
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
-            html.H1("8devices RAG Chatbot (v.0.4.1)", className="text-center mb-2 mt-2"),
+            html.H1("8devices RAG Chatbot (v0.4.2)", className="text-center mb-2 mt-2"),
             html.Hr()
         ])
     ]),

@@ -284,7 +284,10 @@ This project is in active development. For feedback and contributions, contact: 
 
 ## Changelog
 
-### v0.4.1 (Current)
+### v0.4.2 (Current)
+- **FIXED**: Fixed the issue with automatic port allocation
+
+### v0.4.1
 - **NEW**: Multi-user support through automatic port allocation system (ports 8050-8100)
 - **NEW**: Enhanced port management with automatic conflict resolution
 - **NEW**: Port logging and tracking for multiple concurrent app instances
