@@ -1118,7 +1118,14 @@ session_data = {
 startup_message = f"""Naudojatės 8devices RAG Chatbot (v.0.4.1).
 Turėkit omeny, kad ši aplikacija yra alfa versijoje, ir yra greitai atnaujinama. Dabartinis tikslas yra parodyti, kaip galima naudoti Retrieval-Augmented Generation (RAG) su PDF dokumentais, kad praturtinti LLM atsakymus. Visi modeliai yra lokalūs, ir dokumentai yra išsaugomi jūsų kompiuteryje, tad jūsų duomenys nėra perduodami jokiam serveriui. Dėl to, ši aplikacija veikia lėtai.
 
-NAUJA: 
+NAUJA:
+- Kelių vartotojų palaikymas per automatinę prievadų paskirstymo sistemą (prievadai 8050-8100)
+- Prievadų registravimas ir stebėjimas keliems vienu metu veikiantiems programų egzemplioriams
+- Išsami asmeninio naudojimo statistika ir analitika
+- Pažangi eigos stebėjimo sistema su kelių etapų apdorojimu
+- Patobulinta klaidų stebėjimo ir kategorizuotų pranešimų sistema daugumai operacijų
+
+ANKSČIAU: 
 - Projektų Valdymo Sistema - Pilnas skirtingų projektų palaikymas su projektams specifinėmis dokumentų saugyklomis
 - Google Gemini Integracija - Pilnas Gemini 2.5 Pro, Flash ir Flash-Lite modelių palaikymas
 - Pokalbių Režimai - Signle-turn ir Multi-turn pokalbių palaikymas.
@@ -1127,10 +1134,11 @@ NAUJA:
 
 Jei turite pastabų, galite jas pateikti adresu: konradas.m@8devices.com
 
-Greitai:
+GREITAI:
 - Hyperlinks į konkrečius puslapius LLM atsakymuose naudotuose šaltiniuose
 - Įkelti PDF dokumentus į saugią duomenų bazę, o ne į atmintį
 - LLM atsakymų streaming
+- Hibridinė dokumentų paieška su raktažodžiais
 """
 startup_success = True
 
@@ -3283,6 +3291,9 @@ class PortManager:
 
 def start_app():
     """Start the app with automatic port allocation"""
+    # Configure logging to reduce Werkzeug verbosity
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+    
     port_manager = PortManager()
     
     try:
@@ -3301,7 +3312,8 @@ def start_app():
         except:
             pass
         
-        app.run(debug=True, port=port, host='localhost')
+        # Start the app with debug=False to prevent automatic reloading
+        app.run(debug=False, port=port, host='localhost', use_reloader=False)
         
     except Exception as e:
         print(f"Error starting app: {e}")
