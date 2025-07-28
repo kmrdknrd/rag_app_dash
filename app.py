@@ -21,11 +21,13 @@ import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import torch
+import nltk
 from dash import dcc, html, Input, Output, State, callback_context, ALL
 from dash.exceptions import PreventUpdate
 from datasets import load_dataset
 from docling.document_converter import DocumentConverter
 from FlagEmbedding import FlagLLMReranker, LayerWiseFlagLLMReranker
+from page_aware_chunker import chunk_pdf_with_pages
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_ollama import ChatOllama
 from marker.converters.pdf import PdfConverter
@@ -33,12 +35,51 @@ from marker.models import create_model_dict
 from marker.output import text_from_rendered
 from mxbai_rerank import MxbaiRerankV2
 from natsort import natsorted
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import minmax_scale
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, AutoModelForSequenceClassification
 from openai import OpenAI
 import google.generativeai as genai
+
+session_data = {
+    'embeddings': [],
+    'docs_md': [],
+    'doc_paths': [],
+    'pdf_processor': None,
+    'bi_encoder': None,
+    'cross_encoder': None,
+    'llm': None,
+    'llm_client': None,
+    'dir': None,
+    'initialized': False,
+    'projects': [],  # List of available projects
+    'current_project': None,  # Currently selected project
+    'bi_encoder_config': {
+        'model_name': 'Snowflake/snowflake-arctic-embed-l-v2.0',
+        'chunk_size': 2048,
+        'chunk_overlap': 128,
+        'retrieval_count': 50
+    },
+    'cross_encoder_config': {
+        'model_name': 'cross-encoder/ms-marco-MiniLM-L6-v2',
+        'top_n': 8
+    },
+    'hybrid_search_config': {
+        'enabled': True,
+        'bm25_weight': 0.1,
+        'bm25_weight_rerank': 0.9
+    },
+    'llm_config': {
+        'model_name': 'gemini-2.5-flash-lite-preview-06-17',
+        'api_key': None
+    },
+    'rag_mode': True,  # Default to RAG mode
+    'prompt_type': 'loose',  # Default prompt type
+    'conversation_mode': 'single'  # Default conversation mode (single/multi)
+}
 
 # Enhanced Progress Tracking System
 class ProgressTracker:
@@ -217,6 +258,148 @@ class CheckProgressTracker:
 
 # Global check progress tracker instance
 check_progress_tracker = CheckProgressTracker()
+
+# Query Progress Tracking System
+class QueryProgressTracker:
+    """Progress tracker for query processing stages"""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """Reset all progress tracking"""
+        self.current_stage = "idle"
+        self.stage_progress = 0
+        self.stage_total = 0
+        self.overall_progress = 0
+        self.is_active = False
+        self.stage_weights = {
+            "initializing": 5,
+            "retrieving": 30,
+            "reranking": 25,
+            "generating": 40
+        }
+        self.stage_messages = {
+            "initializing": "Initializing query processing...",
+            "retrieving": "Retrieving relevant documents...",
+            "reranking": "Reranking retrieved documents...",
+            "generating": "Generating response..."
+        }
+        self.detailed_log = []
+        self.current_detail = ""
+    
+    def set_stage(self, stage, total_items=1, detail=""):
+        """Set the current processing stage"""
+        self.current_stage = stage
+        self.stage_total = total_items
+        self.stage_progress = 0
+        self.current_detail = detail
+        self.is_active = True
+        message = self.stage_messages.get(stage, stage)
+        if detail:
+            message += f" - {detail}"
+        self.log_message(message)
+        self.calculate_overall_progress()
+    
+    def update_stage_progress(self, progress, detail=""):
+        """Update progress within current stage"""
+        self.stage_progress = progress
+        if detail:
+            self.current_detail = detail
+            self.log_message(f"Progress: {detail}")
+        self.calculate_overall_progress()
+    
+    def increment_stage_progress(self, detail=""):
+        """Increment stage progress by 1"""
+        self.stage_progress += 1
+        if detail:
+            self.current_detail = detail
+            self.log_message(f"Progress: {detail}")
+        self.calculate_overall_progress()
+    
+    def calculate_overall_progress(self):
+        """Calculate overall progress percentage"""
+        if self.current_stage == "idle":
+            self.overall_progress = 0
+            return
+        
+        # Calculate progress for completed stages
+        completed_weight = 0
+        stage_order = ["initializing", "retrieving", "reranking", "generating"]
+        
+        try:
+            current_stage_index = stage_order.index(self.current_stage)
+            for i in range(current_stage_index):
+                completed_weight += self.stage_weights[stage_order[i]]
+        except ValueError:
+            current_stage_index = 0
+        
+        # Calculate progress for current stage
+        if self.stage_total > 0:
+            current_stage_progress = (self.stage_progress / self.stage_total) * self.stage_weights[self.current_stage]
+        else:
+            current_stage_progress = 0
+        
+        self.overall_progress = completed_weight + current_stage_progress
+        self.overall_progress = min(100, max(0, self.overall_progress))
+    
+    def log_message(self, message):
+        """Add a timestamped message to the detailed log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.detailed_log.append(log_entry)
+        print(log_entry)  # Also print to console/log file
+    
+    def get_progress_info(self):
+        """Get current progress information for UI"""
+        if self.current_stage == "idle":
+            return {
+                "progress": 0,
+                "stage": "Ready",
+                "detail": "",
+                "is_active": False,
+                "detailed_message": "Ready to process query"
+            }
+        
+        if self.current_stage == "complete":
+            return {
+                "progress": 100,
+                "stage": "Complete",
+                "detail": "",
+                "is_active": False,
+                "detailed_message": "Response generated successfully!"
+            }
+        
+        stage_message = self.stage_messages.get(self.current_stage, self.current_stage)
+        
+        # Build detailed message
+        if self.current_detail:
+            detailed_message = f"{stage_message} - {self.current_detail}"
+        else:
+            detailed_message = stage_message
+        
+        # Add progress info for stages with multiple items
+        if self.stage_total > 1:
+            detailed_message += f" ({self.stage_progress}/{self.stage_total})"
+        
+        return {
+            "progress": self.overall_progress,
+            "stage": stage_message,
+            "detail": self.current_detail,
+            "is_active": self.is_active,
+            "detailed_message": detailed_message
+        }
+    
+    def complete(self):
+        """Mark processing as complete"""
+        self.current_stage = "complete"
+        self.overall_progress = 100
+        self.current_detail = ""
+        self.is_active = False
+        self.log_message("Query processing complete!")
+
+# Global query progress tracker instance
+query_progress_tracker = QueryProgressTracker()
 
 
 # Personal Statistics Tracking System
@@ -680,6 +863,56 @@ def get_available_projects(base_dir):
             projects.append(project_dir.name)
     return sorted(projects)
 
+def get_bm25_path(base_dir, project_name, model_name, chunk_size, chunk_overlap):
+    """Get BM25 storage path for a specific configuration"""
+    project_dirs = get_project_directories(base_dir, project_name)
+    bm25_path = project_dirs['embeddings'] / model_name / f"chunk_size_{chunk_size}" / f"chunk_overlap_{chunk_overlap}" / "bm25"
+    return bm25_path / "bm25.pkl"
+
+def create_bm25_corpus(documents_embeddings, bm25_path):
+    """Create and save BM25 corpus from document embeddings"""
+    try:
+        # Create BM25 directory if it doesn't exist
+        bm25_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Extract text from documents
+        corpus = [doc["text"] for doc in documents_embeddings]
+        
+        # Tokenize corpus
+        tokenized_corpus = [nltk.word_tokenize(doc) for doc in corpus]
+        
+        # Create BM25 object
+        bm25 = BM25Okapi(tokenized_corpus)
+        
+        # Save BM25 corpus
+        with open(bm25_path, "wb") as f:
+            pickle.dump(tokenized_corpus, f)
+        
+        print(f"BM25 corpus saved to {bm25_path}")
+        return bm25, tokenized_corpus
+    
+    except Exception as e:
+        print(f"Error creating BM25 corpus: {e}")
+        return None, None
+
+def load_bm25_corpus(bm25_path):
+    """Load BM25 corpus from file"""
+    try:
+        if bm25_path.exists():
+            with open(bm25_path, "rb") as f:
+                tokenized_corpus = pickle.load(f)
+            
+            bm25 = BM25Okapi(tokenized_corpus)
+            print(f"BM25 corpus loaded from {bm25_path}")
+            return bm25, tokenized_corpus
+        else:
+            print(f"BM25 corpus not found at {bm25_path}")
+            return None, None
+    
+    except Exception as e:
+        print(f"Error loading BM25 corpus: {e}")
+        return None, None
+
 def create_project(base_dir, project_name):
     """Create a new project with necessary directories"""
     if not project_name or not project_name.strip():
@@ -765,14 +998,23 @@ class PdfProcessor:
             self.converter = DocumentConverter()
             self.converter.initialize_pipeline("pdf")
     
-    def process_document(self, doc_path, save_path=None):
-        """Process document using pre-loaded model with progress tracking"""
+    def process_document(self,
+                         doc_path,
+                         save_path=None, 
+                         chunk_size=session_data['bi_encoder_config']['chunk_size'], 
+                         chunk_overlap=session_data['bi_encoder_config']['chunk_overlap']):
+        """Process document using pre-loaded model with progress tracking and page-aware chunking"""
         # Check if path is to a single file or a directory
         # Process a single file or all files in a directory
         all_texts = []
+        all_page_chunks = []
         
-        # Use the file directly if it's a single file, otherwise get all PDFs in directory
-        files = [doc_path] if doc_path.is_file() else list(doc_path.glob("*.pdf"))
+        # Handle URLs and file paths
+        if isinstance(doc_path, str) and (doc_path.startswith('http://') or doc_path.startswith('https://')):
+            files = [doc_path]  # URL as string
+        else:
+            # Use the file directly if it's a single file, otherwise get all PDFs in directory
+            files = [doc_path] if doc_path.is_file() else list(doc_path.glob("*.pdf"))
         
         if save_path is not None:
             if not os.path.exists(save_path):
@@ -782,31 +1024,58 @@ class PdfProcessor:
         
         # Process each file
         for i, file in enumerate(files):
+            # Get file name for URL or path
+            if isinstance(file, str) and (file.startswith('http://') or file.startswith('https://')):
+                file_stem = file.split('/')[-1].replace('.pdf', '')
+            else:
+                file_stem = file.stem
+            
             # Skip if file already processed
-            if save_path is not None and os.path.exists(save_path / f"{file.stem}.md"):
-                progress_tracker.log_message(f"Skipping {file.stem} because .md already exists")
+            if save_path is not None and os.path.exists(save_path / f"{file_stem}.md"):
+                progress_tracker.log_message(f"Skipping {file_stem} because .md already exists")
                 # Load .md from disk
-                with open(save_path / f"{file.stem}.md", "r") as f:
+                with open(save_path / f"{file_stem}.md", "r") as f:
                     text = f.read()
                 all_texts.append(text)
+                
+                # For skipped files, we need to create page chunks from the saved text
+                # This is a fallback - ideally we'd save page chunks too
+                progress_tracker.log_message(f"Creating page-aware chunks for pre-processed {file_stem}")
+                page_chunks, _ = chunk_pdf_with_pages(str(file), chunk_size, chunk_overlap)
+                all_page_chunks.append(page_chunks)
                 continue
             
-            progress_tracker.log_message(f"Processing {file.stem} ({i+1}/{len(files)})")
+            progress_tracker.log_message(f"Processing {file_stem} ({i+1}/{len(files)})")
             
             if self.converter_type == "marker":
                 rendered_doc = self.converter(str(file))
                 text, _, images = text_from_rendered(rendered_doc)
+                all_texts.append(text)
+                
+                # For marker, we still need to use page-aware chunking
+                progress_tracker.log_message(f"Creating page-aware chunks for {file_stem}")
+                page_chunks, _ = chunk_pdf_with_pages(str(file), chunk_size, chunk_overlap)
+                all_page_chunks.append(page_chunks)
+                
             elif self.converter_type == "docling":
-                rendered_doc = self.converter.convert(file).document
-                text = rendered_doc.export_to_markdown()
-            all_texts.append(text)
+                # Use page-aware chunking directly for docling
+                progress_tracker.log_message(f"Creating page-aware chunks for {file_stem}")
+                page_chunks, full_text = chunk_pdf_with_pages(str(file), chunk_size, chunk_overlap)
+                all_texts.append(full_text)
+                all_page_chunks.append(page_chunks)
             
             if save_path is not None:  # save to .md's
-                with open(save_path / f"{file.stem}.md", "w") as f:
-                    f.write(text)
+                with open(save_path / f"{file_stem}.md", "w") as f:
+                    f.write(all_texts[-1])
         
-        # For single files, return the text as a list with one item
-        return all_texts[0:1] if doc_path.is_file() else all_texts 
+        # For single files, return the text and page chunks as lists with one item
+        is_single_file = (isinstance(doc_path, str) and (doc_path.startswith('http://') or doc_path.startswith('https://'))) or \
+                        (hasattr(doc_path, 'is_file') and doc_path.is_file())
+        
+        if is_single_file:
+            return all_texts[0:1], all_page_chunks[0:1]
+        else:
+            return all_texts, all_page_chunks 
 
 # Enhanced BiEncoder Pipeline with progress tracking
 class BiEncoderPipeline:
@@ -844,6 +1113,78 @@ class BiEncoderPipeline:
             length_function=len
         )
         self.initialized = True
+    
+    def embed_page_aware_documents(self, page_chunks_list, doc_ids=None, save_path=None, track_progress=True):
+        """Embed documents using page-aware chunks with optional progress tracking"""
+        # If single document page chunks given, make it a list
+        if not isinstance(page_chunks_list, list) or (len(page_chunks_list) > 0 and isinstance(page_chunks_list[0], dict)):
+            page_chunks_list = [page_chunks_list]
+        
+        if save_path is not None:
+            actual_save_path = Path(save_path) / self.model_name.split("/")[-1] / f"chunk_size_{self.chunk_size}" / f"chunk_overlap_{self.chunk_overlap}"
+            if track_progress:
+                progress_tracker.log_message(f"Actual save path: {actual_save_path}")
+                # Create save path if it doesn't exist
+                progress_tracker.log_message(f"Creating save directory: {actual_save_path}")
+            if not os.path.exists(actual_save_path):
+                os.makedirs(actual_save_path)
+        
+        # Process each document's page chunks
+        results = []
+        
+        for i, page_chunks in enumerate(page_chunks_list):
+            doc_name = doc_ids[i] if doc_ids else f'doc_{i}'
+            if track_progress:
+                progress_tracker.log_message(f"Embedding document {i+1}/{len(page_chunks_list)}: {doc_name}")
+                progress_tracker.increment_stage_progress(doc_name)
+            
+            # Create a directory for the document if it doesn't exist
+            if save_path and doc_ids:
+                doc_dir = actual_save_path / doc_ids[i]
+                if not os.path.exists(doc_dir):
+                    os.makedirs(doc_dir)
+            
+            # Check if all chunks for this document are already saved
+            if save_path is not None and doc_ids:
+                all_chunks_exist = all(
+                    os.path.exists(f"{actual_save_path}/{doc_ids[i]}/chunk_{j}.pkl") 
+                    for j in range(len(page_chunks))
+                )
+                
+                if all_chunks_exist:
+                    if track_progress:
+                        progress_tracker.log_message(f"Skipping {doc_ids[i]} because all chunks already exist")
+                    # Load existing chunks from disk
+                    for j in range(len(page_chunks)):
+                        with open(f"{actual_save_path}/{doc_ids[i]}/chunk_{j}.pkl", "rb") as f:
+                            chunk_data = pickle.load(f)
+                            results.append(chunk_data)
+                    continue
+            
+            # Extract texts for embedding
+            chunk_texts = [chunk['text'] for chunk in page_chunks]
+            chunk_vectors = self.model.encode(chunk_texts)
+            
+            # Create results with page information
+            for j, (chunk, vector) in enumerate(zip(page_chunks, chunk_vectors)):
+                chunk_result = {
+                    "text": chunk['text'],
+                    "vector": vector,
+                    "page": chunk['page'],
+                    "original_doc_id": doc_ids[i] if doc_ids is not None else None,
+                    "doc_idx": i,
+                    "chunk_idx": j
+                }
+                results.append(chunk_result)
+                
+                # Save chunk with page information
+                if save_path is not None and doc_ids:
+                    chunk_path = f"{actual_save_path}/{doc_ids[i]}/chunk_{j}.pkl"
+                    if not os.path.exists(chunk_path):
+                        with open(chunk_path, "wb") as f:
+                            pickle.dump(chunk_result, f)
+        
+        return results
 
     def embed_documents(self, doc_texts, doc_ids=None, save_path=None, track_progress=True):
         """Embed documents using pre-loaded models with optional progress tracking"""
@@ -950,6 +1291,26 @@ class BiEncoderPipeline:
             }
             for i in top_indices
         ]
+    
+    def retrieve_all(self, query, documents_embeddings):
+        """Retrieve all embeddings using cosine similarity to the query"""
+        
+        # Embed query
+        query_vector = self.model.encode([query])   
+        
+        # Get embeddings from documents dicts
+        stored_vectors = np.array([item["vector"] for item in documents_embeddings])
+        
+        # Compute similarities between query and stored vectors
+        similarities = cosine_similarity(query_vector, stored_vectors).flatten()
+        
+        return [
+            {
+                **documents_embeddings[i],
+                "similarity": float(similarities[i])
+            }
+            for i in range(len(documents_embeddings))
+        ]
 
 class CrossEncoderPipeline:
     _instances = {}  # Class variable to store instances
@@ -984,7 +1345,7 @@ class CrossEncoderPipeline:
         
         self.initialized = True
     
-    def rerank(self, query, documents, top_n=4):
+    def rerank(self, query, documents, top_n=4, hybrid_rerank=False, bm25_weight=0.1):
         """Rerank documents using cross-encoder"""
         
         if self.model_type == "mxbai":
@@ -1005,13 +1366,24 @@ class CrossEncoderPipeline:
             
             reranked_scores = [d.score for d in rerankings]
             reranked_indices = [d.index for d in rerankings]
-            reranked_results = [
-                {
-                    **{k: v for k, v in documents[reranked_indices[i]].items() if k not in ["vector", "match_types"]},
+            reranked_results = []
+            for i in range(min(top_n, len(reranked_indices))):
+                doc = documents[reranked_indices[i]]
+                result = {
+                    **{k: v for k, v in doc.items() if k not in ["vector", "match_types"]},
                     "rerank_score": reranked_scores[i]
                 }
-                for i in range(min(top_n, len(reranked_indices)))
-            ]
+                
+                if hybrid_rerank:
+                    result["rerank_score_bm25"] = result["rerank_score"] + float(doc.get("bm25_score", 0)) * bm25_weight
+                else:
+                    result["rerank_score_bm25"] = result["rerank_score"]
+                
+                reranked_results.append(result)
+            
+            # Sort by hybrid score if hybrid reranking is enabled
+            if hybrid_rerank:
+                reranked_results = sorted(reranked_results, key=lambda x: x['rerank_score_bm25'], reverse=True)[:top_n]
             
             return reranked_results
         else:
@@ -1038,12 +1410,19 @@ class CrossEncoderPipeline:
             # Create results list
             results = []
             for idx, doc in enumerate(documents):
-                results.append({
+                result = {
                     **doc,
                     "rerank_score": float(scores[idx])
-                })
+                }
+                
+                if hybrid_rerank:
+                    result["rerank_score_bm25"] = result["rerank_score"] + float(doc.get("bm25_score", 0)) * bm25_weight
+                else:
+                    result["rerank_score_bm25"] = result["rerank_score"]
+                
+                results.append(result)
             
-            results_sorted = sorted(results, key=lambda x: x['rerank_score'], reverse=True)
+            results_sorted = sorted(results, key=lambda x: x['rerank_score_bm25'], reverse=True)
             return results_sorted[:top_n]
 
 # Initialize the Dash app
@@ -1082,63 +1461,29 @@ Keep your answer grounded in the facts of the DOCUMENTS.
 Reference the IDs of the DOCUMENTS in your response in the format <DOCUMENT1: ID1> <DOCUMENT2: ID2> <DOCUMENT3: ID3> etc."""
 }
 
-session_data = {
-    'embeddings': [],
-    'docs_md': [],
-    'doc_paths': [],
-    'pdf_processor': None,
-    'bi_encoder': None,
-    'cross_encoder': None,
-    'llm': None,
-    'llm_client': None,
-    'dir': None,
-    'initialized': False,
-    'projects': [],  # List of available projects
-    'current_project': None,  # Currently selected project
-    'bi_encoder_config': {
-        'model_name': 'Snowflake/snowflake-arctic-embed-l-v2.0',
-        'chunk_size': 2048,
-        'chunk_overlap': 128,
-        'retrieval_count': 50
-    },
-    'cross_encoder_config': {
-        'model_name': 'cross-encoder/ms-marco-MiniLM-L6-v2',
-        'top_n': 8
-    },
-    'llm_config': {
-        'model_name': 'gemini-2.5-flash-lite-preview-06-17',
-        'api_key': None
-    },
-    'rag_mode': True,  # Default to RAG mode
-    'prompt_type': 'strict',  # Default prompt type
-    'conversation_mode': 'single'  # Default conversation mode (single/multi)
-}
-
 # Startup message
-startup_message = f"""Naudojatės 8devices RAG Chatbot (v0.4.2).
+startup_message = f"""Naudojatės 8devices RAG Chatbot (v0.5.0).
 Turėkit omeny, kad ši aplikacija yra alfa versijoje, ir yra greitai atnaujinama. Dabartinis tikslas yra parodyti, kaip galima naudoti Retrieval-Augmented Generation (RAG) su PDF dokumentais, kad praturtinti LLM atsakymus. Visi modeliai yra lokalūs, ir dokumentai yra išsaugomi jūsų kompiuteryje, tad jūsų duomenys nėra perduodami jokiam serveriui. Dėl to, ši aplikacija veikia lėtai.
 
 NAUJA:
-- Kelių vartotojų palaikymas per automatinę prievadų paskirstymo sistemą (prievadai 8050-8100)
-- Prievadų registravimas ir stebėjimas keliems vienu metu veikiantiems programų egzemplioriams
-- Išsami asmeninio naudojimo statistika ir analitika
-- Pažangi eigos stebėjimo sistema su kelių etapų apdorojimu
-- Patobulinta klaidų stebėjimo ir kategorizuotų pranešimų sistema daugumai operacijų
+- Hyperlinks į LLM atsakymuose naudotų šaltinių konkrečius puslapius
+- Hibridinė dokumentų paieška su raktažodžiais (BM25)
+- UI atnaujinimas
 
 ANKSČIAU: 
+- Išsami asmeninio naudojimo statistika ir analitika
 - Projektų Valdymo Sistema - Pilnas skirtingų projektų palaikymas su projektams specifinėmis dokumentų saugyklomis
-- Google Gemini Integracija - Pilnas Gemini 2.5 Pro, Flash ir Flash-Lite modelių palaikymas
+- Kelių vartotojų palaikymas per automatinę prievadų paskirstymo sistemą (prievadai 8050-8100)
+- Prievadų registravimas ir stebėjimas keliems vienu metu veikiantiems programų egzemplioriams
 - Pokalbių Režimai - Signle-turn ir Multi-turn pokalbių palaikymas.
-- Projektui Prisitaikantis Dokumentų Susiejimas - Spustelėjamos PDF nuorodos su projektui specifiniais URL
-- Dinaminio HTML Turinio Atvaizdavimas - Pilnas paryškinto teksto ir formatuoto turinio palaikymas
 
 Jei turite pastabų, galite jas pateikti adresu: konradas.m@8devices.com
 
 GREITAI:
-- Hyperlinks į konkrečius puslapius LLM atsakymuose naudotuose šaltiniuose
-- Įkelti PDF dokumentus į saugią duomenų bazę, o ne į atmintį
 - LLM atsakymų streaming
-- Hibridinė dokumentų paieška su raktažodžiais
+- Test režimas
+- Citation highlighting šaltiniuose
+- Dalinimosi mygtukai
 """
 startup_success = True
 
@@ -1146,7 +1491,7 @@ startup_success = True
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
-            html.H1("8devices RAG Chatbot (v0.4.2)", className="text-center mb-2 mt-2"),
+            html.H1("8devices RAG Chatbot (v0.5.0)", className="text-center mb-2 mt-2"),
             html.Hr()
         ])
     ]),
@@ -1388,6 +1733,24 @@ app.layout = dbc.Container([
                             )
                         ], width=12)
                     ]),
+                    # Query Processing Progress Bar
+                    html.Div([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H6("Query Processing", className="card-title"),
+                                dbc.Progress(
+                                    id="query-progress-bar",
+                                    value=0,
+                                    striped=True,
+                                    animated=True,
+                                    color="primary",
+                                    style={"height": "20px", "margin-bottom": "10px"}
+                                ),
+                                html.P(id="query-progress-status", children="Ready to process query", className="mb-1 small"),
+                                html.P(id="query-progress-detail", children="", className="mb-0 small text-muted")
+                            ])
+                        ])
+                    ], id="query-progress-container", style={'display': 'none', 'margin-bottom': '10px'}),
                     html.Div(id='chat-history', style={
                         'height': '400px',
                         'overflowY': 'auto',
@@ -1455,7 +1818,7 @@ app.layout = dbc.Container([
                     dbc.Row([
                         dbc.Col([
                             html.Small(
-                                "Strict: Only uses information from uploaded documents. LLM cannot use its pre-trained knowledge.",
+                                "Loose: Uses documents as starting point but freely combines with LLM's broader knowledge.",
                                 id="prompt-explainer",
                                 className="text-muted mb-2 d-block"
                             )
@@ -1508,8 +1871,14 @@ app.layout = dbc.Container([
     # Hidden store for cross-encoder configuration
     dcc.Store(id='cross-encoder-config', data=session_data['cross_encoder_config']),
     
+    # Hidden store for hybrid search configuration
+    dcc.Store(id='hybrid-search-config', data=session_data['hybrid_search_config']),
+    
     # Hidden store for project data
     dcc.Store(id='project-data', data={'projects': [], 'current_project': None}),
+    
+    # Hidden store for triggering chat processing
+    dcc.Store(id='chat-processing-trigger', data=None),
     
     # Auto-refresh interval for log display
     dcc.Interval(id="log-interval", interval=1000, n_intervals=0),
@@ -1563,7 +1932,7 @@ app.layout = dbc.Container([
             html.H6("Bi-Encoder Configuration", className="mb-3"),
             dbc.Row([
                 dbc.Col([
-                    html.Label("Bi-Encoder Model", className="mb-2"),
+                    html.Label("Model", className="mb-2"),
                     dbc.Select(
                         id='bi-encoder-model-select',
                         options=[
@@ -1587,9 +1956,7 @@ app.layout = dbc.Container([
                         value=session_data['bi_encoder_config']['chunk_size'],
                         className="mb-3"
                     )
-                ], width=6)
-            ]),
-            dbc.Row([
+                ], width=3),
                 dbc.Col([
                     html.Label("Chunk Overlap", className="mb-2"),
                     dbc.Select(
@@ -1602,7 +1969,9 @@ app.layout = dbc.Container([
                         value=session_data['bi_encoder_config']['chunk_overlap'],
                         className="mb-3"
                     )
-                ], width=6),
+                ], width=3)
+            ]),
+            dbc.Row([
                 dbc.Col([
                     html.Label("Retrieval Count", className="mb-2"),
                     dbc.Select(
@@ -1626,7 +1995,7 @@ app.layout = dbc.Container([
                         id='cross-encoder-model-select',
                         options=[
                             {'label': 'MS Marco MiniLM-L6-v2', 'value': 'cross-encoder/ms-marco-MiniLM-L6-v2'},
-                            {'label': 'MxBai Rerank Base v2', 'value': 'mixedbread-ai/mxbai-rerank-base-v2'}
+                            {'label': 'Mxbai Rerank Base v2', 'value': 'mixedbread-ai/mxbai-rerank-base-v2'}
                         ],
                         value=session_data['cross_encoder_config']['model_name'],
                         className="mb-3"
@@ -1640,6 +2009,48 @@ app.layout = dbc.Container([
                         value=session_data['cross_encoder_config']['top_n'],
                         className="mb-3"
                     )
+                ], width=6)
+            ]),
+            html.Hr(),
+            html.H6("Hybrid Search Configuration", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Checklist(
+                        id='hybrid-search-enabled',
+                        options=[
+                            {'label': 'Enable Hybrid Search (Dense + Sparse)', 'value': 'enabled'}
+                        ],
+                        value=['enabled'] if session_data['hybrid_search_config']['enabled'] else [],
+                        className="mb-3"
+                    )
+                ], width=12)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    html.Label("BM25 Weight (Retrieval)", className="mb-2"),
+                    dbc.Input(
+                        id='bm25-weight-input',
+                        type='number',
+                        value=session_data['hybrid_search_config']['bm25_weight'],
+                        min=0,
+                        max=1,
+                        step=0.1,
+                        className="mb-3"
+                    ),
+                    html.Small("Weight for BM25 scores in retrieval (0.0-1.0)", className="form-text text-muted")
+                ], width=6),
+                dbc.Col([
+                    html.Label("BM25 Weight (Reranking)", className="mb-2"),
+                    dbc.Input(
+                        id='bm25-weight-rerank-input',
+                        type='number',
+                        value=session_data['hybrid_search_config']['bm25_weight_rerank'],
+                        min=0,
+                        max=1,
+                        step=0.1,
+                        className="mb-3"
+                    ),
+                    html.Small("Weight for BM25 scores in reranking (0.0-1.0)", className="form-text text-muted")
                 ], width=6)
             ])
         ]),
@@ -1696,6 +2107,31 @@ def update_check_progress_display(n_intervals):
     return (
         progress_info['progress'],
         progress_info['status'],
+        progress_info['detail'],
+        container_style
+    )
+
+# Callback for query progress tracking
+@app.callback(
+    [Output('query-progress-bar', 'value'),
+     Output('query-progress-status', 'children'),
+     Output('query-progress-detail', 'children'),
+     Output('query-progress-container', 'style')],
+    [Input('progress-interval', 'n_intervals')]
+)
+def update_query_progress_display(n_intervals):
+    """Update the query progress bar display"""
+    progress_info = query_progress_tracker.get_progress_info()
+    
+    # Show/hide progress container based on activity
+    if progress_info['is_active']:
+        container_style = {'display': 'block', 'margin-bottom': '10px'}
+    else:
+        container_style = {'display': 'none', 'margin-bottom': '10px'}
+    
+    return (
+        progress_info['progress'],
+        progress_info['stage'],
         progress_info['detail'],
         container_style
     )
@@ -1982,6 +2418,11 @@ def check_processed_pdfs(n_clicks, project_data):
         # Track button click
         personal_stats.track_button_click('check_processed')
         
+        # Initialize PDF processor if needed
+        if session_data['pdf_processor'] is None:
+            session_data['pdf_processor'] = PdfProcessor()
+            print("PDF processor initialized")
+        
         # Set up directories
         if session_data['dir'] is None:
             session_data['dir'] = Path.cwd()
@@ -2034,10 +2475,6 @@ def check_processed_pdfs(n_clicks, project_data):
         # If there are missing markdown files, process them automatically
         if missing_md:
             print(f"Found PDFs without markdown files: {missing_md}. Processing them now...")
-            
-            # Initialize PDF processor if needed
-            if session_data['pdf_processor'] is None:
-                session_data['pdf_processor'] = PdfProcessor()
             
             # Process the missing PDFs
             for pdf_stem in missing_md:
@@ -2110,34 +2547,38 @@ def check_processed_pdfs(n_clicks, project_data):
                 )
                 print("Cross-encoder initialized")
             
-            # Prepare documents for embedding
-            docs_to_embed = []
+            # Prepare documents for embedding with page awareness
+            page_chunks_to_embed = []
             doc_ids_to_embed = []
             
             for doc_id in missing_embeddings:
-                md_file = processed_dir / f"{doc_id}.md"
-                if md_file.exists():
-                    with open(md_file, 'r') as f:
-                        docs_to_embed.append(f.read())
-                        doc_ids_to_embed.append(doc_id)
-                        print(f"Prepared {doc_id} for embedding")
+                pdf_file = docs_dir / f"{doc_id}.pdf"
+                if pdf_file.exists():
+                    # Get page chunks directly from PDF
+                    _, page_chunks_list = session_data['pdf_processor'].process_document(
+                        pdf_file,
+                        save_path=None  # Don't save again, just get page chunks
+                    )
+                    page_chunks_to_embed.extend(page_chunks_list)
+                    doc_ids_to_embed.extend([doc_id] * len(page_chunks_list))
+                    print(f"Prepared {doc_id} for embedding ({len(page_chunks_list)} chunks)")
                 else:
-                    print(f"Warning: Markdown file not found for {doc_id}")
+                    print(f"Warning: PDF file not found for {doc_id}")
             
             # Create embeddings for missing documents
-            if docs_to_embed:
-                print(f"Creating embeddings for {len(docs_to_embed)} documents...")
+            if page_chunks_to_embed:
+                print(f"Creating embeddings for {len(page_chunks_to_embed)} chunks from {len(missing_embeddings)} documents...")
                 
                 try:
-                    # Create embeddings
-                    new_embeddings = session_data['bi_encoder'].embed_documents(
-                        docs_to_embed,
+                    # Create embeddings with page awareness
+                    new_embeddings = session_data['bi_encoder'].embed_page_aware_documents(
+                        page_chunks_to_embed,
                         doc_ids=doc_ids_to_embed,
                         save_path=embeddings_dir,
                         track_progress=False
                     )
                     
-                    print(f"Successfully created embeddings for {len(docs_to_embed)} documents")
+                    print(f"Successfully created embeddings for {len(missing_embeddings)} documents")
                     
                 except Exception as e:
                     print(f"Error creating embeddings: {str(e)}")
@@ -2180,18 +2621,48 @@ def check_processed_pdfs(n_clicks, project_data):
             print("Cross-encoder model already loaded...")
             check_progress_tracker.set_step(5, "Cross-encoder ready", "Model already loaded")
         
-        # Load embeddings
-        print("Loading embeddings...")
+        # Load existing embeddings from disk
+        print("Loading existing embeddings from disk...")
         check_progress_tracker.set_step(6, "Loading embeddings", f"Loading embeddings for {len(doc_ids)} documents...")
-        embeddings = session_data['bi_encoder'].embed_documents(
-            processed_docs, 
-            doc_ids=doc_ids,
-            save_path=embeddings_dir,
-            track_progress=False
-        )
+        
+        # Load embeddings from saved pickle files
+        embeddings = []
+        
+        for doc_id in doc_ids:
+            doc_dir = embeddings_dir / model_name / f"chunk_size_{chunk_size}" / f"chunk_overlap_{chunk_overlap}" / doc_id
+            if doc_dir.exists():
+                # Load all chunks for this document
+                chunk_files = sorted(doc_dir.glob("chunk_*.pkl"))
+                for chunk_file in chunk_files:
+                    with open(chunk_file, "rb") as f:
+                        chunk_data = pickle.load(f)
+                        embeddings.append(chunk_data)
+                        
+        print(f"Loaded {len(embeddings)} embeddings from disk")
         session_data['embeddings'] = embeddings
         session_data['docs_md'] = processed_docs
         session_data['doc_paths'] = doc_ids
+        
+        # Create BM25 corpus for hybrid search
+        try:
+            bi_encoder_config = session_data['bi_encoder_config']
+            bm25_path = get_bm25_path(
+                session_data['dir'], 
+                current_project,
+                bi_encoder_config['model_name'],
+                bi_encoder_config['chunk_size'],
+                bi_encoder_config['chunk_overlap']
+            )
+            
+            print("Creating BM25 corpus for hybrid search...")
+            bm25, tokenized_corpus = create_bm25_corpus(embeddings, bm25_path)
+            if bm25 is not None:
+                print("BM25 corpus created successfully")
+            else:
+                print("Warning: BM25 corpus creation failed")
+        except Exception as e:
+            print(f"Warning: BM25 corpus creation failed: {e}")
+        
         session_data['initialized'] = True
         
         print("System ready for chatting!")
@@ -2317,11 +2788,13 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
             if not (processed_dir / f"{pdf_file.stem}.md").exists():
                 progress_tracker.increment_stage_progress(pdf_file.stem)
                 
-                processed_docs = session_data['pdf_processor'].process_document(
+                # Get both texts and page chunks 
+                # Note: We could skip saving markdown files since we use page chunks directly
+                texts, page_chunks_list = session_data['pdf_processor'].process_document(
                     pdf_file, 
-                    save_path=processed_dir
+                    save_path=processed_dir  # Still save for debugging/inspection
                 )
-                session_data['docs_md'].extend(processed_docs)
+                session_data['docs_md'].extend(texts)
             else:
                 progress_tracker.increment_stage_progress(f"{pdf_file.stem} (skipped)")
         
@@ -2347,24 +2820,51 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
         
         progress_tracker.update_stage_progress(1, "Models initialized")
         
-        # Stage 4: Create embeddings
-        processed_docs = []
+        # Stage 4: Create embeddings with page awareness
+        # Process PDFs directly to get page chunks instead of reading from markdown
+        all_page_chunks = []
         doc_ids = []
-        for md_file in processed_dir.glob("*.md"):
-            with open(md_file, 'r') as f:
-                processed_docs.append(f.read())
-            doc_ids.append(md_file.stem)
         
-        progress_tracker.set_stage("embedding_creation", len(processed_docs))
+        pdf_files = list(docs_dir.glob("*.pdf"))
+        progress_tracker.set_stage("embedding_creation", len(pdf_files))
         
-        if processed_docs:
-            # Use progress tracking in embedding
-            embeddings = session_data['bi_encoder'].embed_documents(
-                processed_docs, 
+        if pdf_files:
+            for pdf_file in pdf_files:
+                # Get page chunks directly from PDF
+                _, page_chunks_list = session_data['pdf_processor'].process_document(
+                    pdf_file,
+                    save_path=None  # Don't save again, just get page chunks
+                )
+                all_page_chunks.extend(page_chunks_list)
+                doc_ids.extend([pdf_file.stem] * len(page_chunks_list))
+            
+            # Use page-aware embedding creation
+            embeddings = session_data['bi_encoder'].embed_page_aware_documents(
+                all_page_chunks, 
                 doc_ids=doc_ids,
                 save_path=embeddings_dir
             )
             session_data['embeddings'] = embeddings
+            
+            # Create BM25 corpus for hybrid search
+            try:
+                bi_encoder_config = session_data['bi_encoder_config']
+                bm25_path = get_bm25_path(
+                    session_data['dir'], 
+                    current_project,
+                    bi_encoder_config['model_name'],
+                    bi_encoder_config['chunk_size'],
+                    bi_encoder_config['chunk_overlap']
+                )
+                
+                print("Creating BM25 corpus for hybrid search...")
+                bm25, tokenized_corpus = create_bm25_corpus(embeddings, bm25_path)
+                if bm25 is not None:
+                    print("BM25 corpus created successfully")
+                else:
+                    print("Warning: BM25 corpus creation failed")
+            except Exception as e:
+                print(f"Warning: BM25 corpus creation failed: {e}")
         
         # Store doc paths for display
         session_data['doc_paths'] = [f.stem for f in pdf_files]
@@ -2390,11 +2890,12 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
             'error'
         )
 
-# Complete chat callback with full LLM integration
+# First callback: Handle immediate user input display
 @app.callback(
     [Output('chat-history', 'children'),
      Output('chat-messages', 'children'),
-     Output('user-input', 'value')],
+     Output('user-input', 'value'),
+     Output('chat-processing-trigger', 'data')],
     [Input('send-button', 'n_clicks'),
      Input('user-input', 'n_submit'),
      Input('clear-chat-button', 'n_clicks')],
@@ -2406,8 +2907,8 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
      State('prompt-type-select', 'value'),
      State('conversation-mode-select', 'value')]
 )
-def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, processing_state, project_data, rag_mode, prompt_type, conversation_mode):
-    """Complete chat handler with full LLM integration and RAG functionality"""
+def handle_user_input(n_clicks, n_submit, clear_clicks, user_input, messages_json, processing_state, project_data, rag_mode, prompt_type, conversation_mode):
+    """Handle immediate user input display without processing"""
     ctx = callback_context
     if not ctx.triggered:
         raise PreventUpdate
@@ -2418,6 +2919,8 @@ def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, pro
     if button_id == 'clear-chat-button':
         personal_stats.track_button_click('clear_chat')
         session_data['conversation_history'] = []
+        # Reset query progress when clearing chat
+        query_progress_tracker.reset()
         return [], "[]", ""
     
     # Handle send message
@@ -2454,7 +2957,7 @@ def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, pro
                     ])
                 ], color="danger", outline=True, className="mb-2")]
                 
-                return error_display, json.dumps(messages), ""
+                return error_display, json.dumps(messages), "", dash.no_update
             
             if processing_state != 'ready':
                 raise PreventUpdate
@@ -2484,304 +2987,36 @@ def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, pro
                 ])
             ], color="danger", outline=True, className="mb-2")]
             
-            return error_display, json.dumps(messages), ""
+            return error_display, json.dumps(messages), "", dash.no_update
         
         try:
             # Parse existing messages
             messages = json.loads(messages_json) if messages_json else []
             
-            # Add user message
+            # Add user message immediately
             messages.append({
                 'role': 'user',
                 'content': user_input,
                 'timestamp': datetime.now().strftime("%H:%M:%S")
             })
             
-            # Track model usage for every query
-            model_name = session_data['llm_config']['model_name']
-            personal_stats.track_model_usage(model_name)
-            
-            if session_data['llm'] is None:
-                print(f"Initializing LLM with model: {model_name}...")
-                
-                # Check if it's an OpenAI or Gemini model
-                openai_models = ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'o3', 'o4-mini']
-                gemini_models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']
-                
-                if model_name in openai_models:
-                    api_key = session_data['llm_config'].get('api_key')
-                    if not api_key:
-                        raise ValueError("OpenAI API key is required for OpenAI models")
-                    session_data['llm_client'] = OpenAI(api_key=api_key)
-                    session_data['llm'] = 'openai'  # Use string to indicate OpenAI
-                elif model_name in gemini_models:
-                    api_key = session_data['llm_config'].get('api_key')
-                    if not api_key:
-                        raise ValueError("Gemini API key is required for Gemini models")
-                    genai.configure(api_key=api_key)
-                    session_data['llm_client'] = genai.GenerativeModel(model_name)
-                    session_data['llm'] = 'gemini'  # Use string to indicate Gemini
-                else:
-                    session_data['llm'] = ChatOllama(model=model_name)
-            
-            # Generate response based on RAG mode
-            if session_data['rag_mode'] and session_data.get('embeddings'):
-                # RAG mode: Retrieve and use relevant documents
-                retrieval_count = session_data['bi_encoder_config']['retrieval_count']
-                print(f"Retrieving top {retrieval_count} documents...")
-                retrieved_docs = session_data['bi_encoder'].retrieve_top_k(
-                    user_input, 
-                    session_data['embeddings'], 
-                    top_k=retrieval_count
-                )
-                print("Reranking documents...")
-                # Rerank documents
-                top_n = session_data['cross_encoder_config']['top_n']
-                print(f"Reranking to top {top_n} documents...")
-                reranked_docs = session_data['cross_encoder'].rerank(
-                    user_input, 
-                    retrieved_docs, 
-                    top_n=top_n
-                )
-                print("Generating response with context...")
-                # Generate response with context
-                context_ids = [doc["original_doc_id"] for doc in reranked_docs]
-                context_texts = [doc["text"] for doc in reranked_docs]
-                context_texts_pretty = "\n".join([
-                    f"<DOCUMENT{i+1}: {context_ids[i]}>\nTEXT:\n{text}\n</DOCUMENT{i+1}: {context_ids[i]}>\n" 
-                    for i, text in enumerate(context_texts)
-                ])
-                
-                # Track document references
-                personal_stats.track_document_references(context_ids)
-                personal_stats.total_stats['documents_retrieved_total'] += len(context_ids)
-                
-                # Get the selected prompt type and corresponding instructions
-                prompt_type = session_data.get('prompt_type', 'strict')
-                conversation_mode = session_data.get('conversation_mode', 'single')
-                print(f"Using prompt type: {prompt_type}, conversation mode: {conversation_mode}")
-                
-                # Get the selected prompt instructions
-                selected_instructions = PROMPT_INSTRUCTIONS.get(prompt_type, PROMPT_INSTRUCTIONS['strict'])
-                
-                # Build conversation history if in multi-turn mode
-                conversation_history = ""
-                if conversation_mode == 'multi':
-                    conversation_history = build_conversation_history(json.dumps(messages[:-1]))  # Exclude current message
-                    if conversation_history:
-                        conversation_history = f"""
-                <CONVERSATION_HISTORY>
-                {conversation_history}
-                </CONVERSATION_HISTORY>
-                """
-                
-                rag_prompt = f"""
-                <QUERY>
-                {user_input}
-                </QUERY>
-
-                <INSTRUCTIONS>
-                {selected_instructions}
-                </INSTRUCTIONS>
-                {conversation_history}
-                <DOCUMENTS>
-                {context_texts_pretty}
-                </DOCUMENTS>
-                """
-                
-                print("Invoking LLM for RAG response...")
-                
-                # Start timing response generation
-                response_start_time = time.time()
-                
-                # Handle different LLM types
-                if session_data['llm'] == 'openai':
-                    model_name = session_data['llm_config']['model_name']
-                    client = session_data['llm_client']
-                    
-                    # Use proper conversation history format for OpenAI in multi-turn mode
-                    if conversation_mode == 'multi':
-                        # Build messages with conversation history
-                        openai_messages = build_openai_conversation_history(json.dumps(messages[:-1]))
-                        
-                        # Create system message with instructions and documents
-                        system_message = f"""
-                        <INSTRUCTIONS>
-                        {selected_instructions}
-                        </INSTRUCTIONS>
-                        
-                        <DOCUMENTS>
-                        {context_texts_pretty}
-                        </DOCUMENTS>
-                        """
-                        
-                        # Insert system message at the beginning
-                        openai_messages.insert(0, {"role": "system", "content": system_message})
-                        
-                        # Add current user query
-                        openai_messages.append({"role": "user", "content": user_input})
-                        
-                        response = client.chat.completions.create(
-                            model=model_name,
-                            messages=openai_messages,
-                            max_tokens=1024,
-                            n=1
-                        )
-                    else:
-                        # Single-turn mode - use the current format
-                        response = client.chat.completions.create(
-                            model=model_name,
-                            messages=[{"role": "user", "content": rag_prompt}],
-                            max_tokens=1024,
-                            n=1
-                        )
-                    response_content = response.choices[0].message.content.strip()
-                    
-                elif session_data['llm'] == 'gemini':
-                    client = session_data['llm_client']
-                    response = client.generate_content(rag_prompt)
-                    response_content = response.text.strip()
-                    
-                else:
-                    response = session_data['llm'].invoke(rag_prompt)
-                    response_content = response.content.split("</think>")[1] if "</think>" in response.content else response.content
-                
-                # Add project-specific PDF links
-                current_project = session_data.get('current_project', 'default')
-                
-                # Handle both old and new document reference formats
-                for i, doc_name in enumerate(context_ids):
-                    # Old format: DOCUMENT1, DOCUMENT2, etc.
-                    response_content = response_content.replace(f"DOCUMENT{i+1}",
-                                                                f"<a href='docs_pdf/{current_project}/{doc_name}.pdf'>[{i+1}]</a>")
-                
-                # New format: <document_id>X</document_id>
-                doc_id_pattern = r'<document_id>(\d+)</document_id>'
-                def replace_doc_id(match):
-                    doc_num = int(match.group(1))
-                    if 1 <= doc_num <= len(context_ids):
-                        doc_name = context_ids[doc_num-1]
-                        return f"<a href='docs_pdf/{current_project}/{doc_name}.pdf'>[{doc_num}]</a>"
-                    return match.group(0)  # Return original if invalid
-                
-                response_content = re.sub(doc_id_pattern, replace_doc_id, response_content)
-                
-                # Calculate response time
-                response_time = time.time() - response_start_time
-                
-                # Track the response
-                personal_stats.track_response(response_content, response_time, success=True)
-                
-            else:
-                # Non-RAG mode: Direct chat without document context
-                conversation_mode = session_data.get('conversation_mode', 'single')
-                print(f"Generating direct response in {conversation_mode} mode...")
-                
-                # Build conversation history if in multi-turn mode
-                conversation_history = ""
-                if conversation_mode == 'multi':
-                    conversation_history = build_conversation_history(json.dumps(messages[:-1]))
-                    if conversation_history:
-                        conversation_history = f"""
-                <CONVERSATION_HISTORY>
-                {conversation_history}
-                </CONVERSATION_HISTORY>
-                """
-                
-                chat_prompt = f"""
-                <QUERY>
-                {user_input}
-                </QUERY>
-
-                <INSTRUCTIONS>
-                Provide a helpful and informative response to the user's query.
-                Be concise but thorough in your explanation.
-                </INSTRUCTIONS>
-                {conversation_history}
-                """
-                
-                print("Invoking LLM for direct response...")
-                
-                # Start timing response generation
-                response_start_time = time.time()
-                
-                # Handle different LLM types
-                if session_data['llm'] == 'openai':
-                    model_name = session_data['llm_config']['model_name']
-                    client = session_data['llm_client']
-                    
-                    # Use proper conversation history format for OpenAI in multi-turn mode
-                    if conversation_mode == 'multi':
-                        # Build messages with conversation history
-                        openai_messages = build_openai_conversation_history(json.dumps(messages[:-1]))
-                        
-                        # Create system message with instructions
-                        system_message = """
-                        <INSTRUCTIONS>
-                        Provide a helpful and informative response to the user's query.
-                        Be concise but thorough in your explanation.
-                        </INSTRUCTIONS>
-                        """
-                        
-                        # Insert system message at the beginning
-                        openai_messages.insert(0, {"role": "system", "content": system_message})
-                        
-                        # Add current user query
-                        openai_messages.append({"role": "user", "content": user_input})
-                        
-                        response = client.chat.completions.create(
-                            model=model_name,
-                            messages=openai_messages,
-                            max_tokens=1024,
-                            n=1
-                        )
-                    else:
-                        # Single-turn mode - use the current format
-                        response = client.chat.completions.create(
-                            model=model_name,
-                            messages=[{"role": "user", "content": chat_prompt}],
-                            max_tokens=1024,
-                            n=1
-                        )
-                    response_content = response.choices[0].message.content.strip()
-                    
-                elif session_data['llm'] == 'gemini':
-                    client = session_data['llm_client']
-                    # Gemini uses the text-based conversation history format
-                    response = client.generate_content(chat_prompt)
-                    response_content = response.text.strip()
-                    
-                else:
-                    response = session_data['llm'].invoke(chat_prompt)
-                    response_content = response.content.split("</think>")[1] if "</think>" in response.content else response.content
-                
-                # Calculate response time
-                response_time = time.time() - response_start_time
-                
-                # Track the response
-                personal_stats.track_response(response_content, response_time, success=True)
-            
-            print("Processing response...")
-            # Add assistant message
-            messages.append({
-                'role': 'assistant',
-                'content': response_content,
-                'timestamp': datetime.now().strftime("%H:%M:%S")
-            })
-            
-            # Create chat history display
+            # Create chat display with just the user message
             chat_display = []
             for msg in messages:
                 if msg['role'] == 'user':
                     chat_display.append(
-                        dbc.Card([
-                            dbc.CardBody([
-                                html.Small(msg['timestamp'], className="text-muted"),
-                                html.Div(parse_html_content(msg['content']), 
-                                        className="mb-0", 
-                                        style={"whiteSpace": "pre-wrap", "wordWrap": "break-word"})
-                            ])
-                        ], color="primary", outline=True, className="mb-2")
+                        html.Div([
+                            html.Div([
+                                dbc.Card([
+                                    dbc.CardBody([
+                                        html.Small(msg['timestamp'], className="text-muted"),
+                                        html.Div(parse_html_content(msg['content']), 
+                                                className="mb-0", 
+                                                style={"whiteSpace": "pre-wrap", "wordWrap": "break-word"})
+                                    ])
+                                ], outline=True, className="mb-2", style={"backgroundColor": "#f8f9fa"})
+                            ], style={"display": "inline-block", "maxWidth": "70%", "minWidth": "20%"})
+                        ], style={"textAlign": "right", "marginLeft": "0", "paddingLeft": "25%"})
                     )
                 else:
                     chat_display.append(
@@ -2795,16 +3030,22 @@ def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, pro
                         ], color="secondary", outline=True, className="mb-2")
                     )
             
-            print("Chat response generated successfully")
-            return chat_display, json.dumps(messages), ""
+            # Trigger the processing callback with the updated messages
+            trigger_data = {
+                'messages': json.dumps(messages),
+                'timestamp': time.time(),
+                'user_input': user_input,
+                'rag_mode': rag_mode,
+                'prompt_type': prompt_type,
+                'conversation_mode': conversation_mode,
+                'project_data': project_data
+            }
+            
+            return chat_display, json.dumps(messages), "", trigger_data
             
         except Exception as e:
             error_msg = f"Error: {str(e)}"
-            print(f"Chat error: {error_msg}")
-            
-            # Track the error
-            personal_stats.track_error('query_errors')
-            personal_stats.track_response(error_msg, 0, success=False)
+            print(f"User input error: {error_msg}")
             
             messages = json.loads(messages_json) if messages_json else []
             messages.append({
@@ -2813,9 +3054,458 @@ def handle_chat(n_clicks, n_submit, clear_clicks, user_input, messages_json, pro
                 'timestamp': datetime.now().strftime("%H:%M:%S")
             })
             
-            return [dbc.Alert(error_msg, color="danger", dismissable=True)], json.dumps(messages), ""
+            return [dbc.Alert(error_msg, color="danger", dismissable=True)], json.dumps(messages), "", dash.no_update
     
-    raise PreventUpdate
+    return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+# Second callback: Handle chat processing (RAG/LLM)
+@app.callback(
+    [Output('chat-history', 'children', allow_duplicate=True),
+     Output('chat-messages', 'children', allow_duplicate=True)],
+    [Input('chat-processing-trigger', 'data')],
+    prevent_initial_call=True
+)
+def handle_chat_processing(trigger_data):
+    """Handle the actual chat processing with RAG and LLM"""
+    if not trigger_data:
+        raise PreventUpdate
+    
+    try:
+        # Extract data from trigger
+        messages = json.loads(trigger_data['messages'])
+        user_input = trigger_data['user_input']
+        rag_mode = trigger_data['rag_mode']
+        prompt_type = trigger_data['prompt_type']
+        conversation_mode = trigger_data['conversation_mode']
+        project_data = trigger_data['project_data']
+        
+        # Initialize query progress tracking
+        query_progress_tracker.reset()
+        query_progress_tracker.set_stage("initializing", detail="Setting up query processing")
+        
+        # Track model usage for every query
+        model_name = session_data['llm_config']['model_name']
+        personal_stats.track_model_usage(model_name)
+        
+        if session_data['llm'] is None:
+            print(f"Initializing LLM with model: {model_name}...")
+            
+            # Check if it's an OpenAI or Gemini model
+            openai_models = ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'o3', 'o4-mini']
+            gemini_models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']
+            
+            if model_name in openai_models:
+                api_key = session_data['llm_config'].get('api_key')
+                if not api_key:
+                    raise ValueError("OpenAI API key is required for OpenAI models")
+                session_data['llm_client'] = OpenAI(api_key=api_key)
+                session_data['llm'] = 'openai'  # Use string to indicate OpenAI
+            elif model_name in gemini_models:
+                api_key = session_data['llm_config'].get('api_key')
+                if not api_key:
+                    raise ValueError("Gemini API key is required for Gemini models")
+                genai.configure(api_key=api_key)
+                session_data['llm_client'] = genai.GenerativeModel(model_name)
+                session_data['llm'] = 'gemini'  # Use string to indicate Gemini
+            else:
+                session_data['llm'] = ChatOllama(model=model_name)
+        
+        # Generate response based on RAG mode
+        if session_data['rag_mode'] and session_data.get('embeddings'):
+            # RAG mode: Retrieve and use relevant documents
+            retrieval_count = session_data['bi_encoder_config']['retrieval_count']
+            hybrid_enabled = session_data['hybrid_search_config']['enabled']
+            
+            # Update progress to retrieval stage
+            query_progress_tracker.set_stage("retrieving", detail=f"Retrieving {retrieval_count} relevant documents")
+            
+            if hybrid_enabled:
+                print(f"Hybrid search enabled - retrieving all documents for hybrid scoring...")
+                
+                # Get all documents with dense scores
+                all_docs_dense = session_data['bi_encoder'].retrieve_all(
+                    user_input, 
+                    session_data['embeddings']
+                )
+                
+                # Load or create BM25 corpus
+                current_project = session_data.get('current_project')
+                if current_project:
+                    bi_encoder_config = session_data['bi_encoder_config']
+                    bm25_path = get_bm25_path(
+                        session_data['dir'], 
+                        current_project,
+                        bi_encoder_config['model_name'],
+                        bi_encoder_config['chunk_size'],
+                        bi_encoder_config['chunk_overlap']
+                    )
+                    
+                    # Try to load existing BM25 corpus
+                    bm25, tokenized_corpus = load_bm25_corpus(bm25_path)
+                    
+                    # If BM25 corpus doesn't exist, create it
+                    if bm25 is None:
+                        print("Creating BM25 corpus...")
+                        bm25, tokenized_corpus = create_bm25_corpus(session_data['embeddings'], bm25_path)
+                    
+                    if bm25 is not None:
+                        # Get BM25 scores
+                        tokenized_query = nltk.word_tokenize(user_input)
+                        bm25_scores = bm25.get_scores(tokenized_query)
+                        bm25_scores_normalized = minmax_scale(bm25_scores)
+                        
+                        # Combine dense and sparse scores
+                        bm25_weight = session_data['hybrid_search_config']['bm25_weight']
+                        dense_scores = np.array([doc["similarity"] for doc in all_docs_dense])
+                        combined_scores = dense_scores + bm25_scores_normalized * bm25_weight
+                        
+                        # Get top k documents based on combined scores
+                        top_indices = np.argsort(combined_scores)[-retrieval_count:][::-1]
+                        retrieved_docs = []
+                        for i in top_indices:
+                            doc = all_docs_dense[i].copy()
+                            doc["bm25_score"] = bm25_scores_normalized[i]
+                            doc["retrieval_score"] = combined_scores[i]
+                            retrieved_docs.append(doc)
+                        
+                        print(f"Hybrid search retrieved top {retrieval_count} documents...")
+                    else:
+                        print("BM25 corpus creation failed, falling back to dense-only search...")
+                        retrieved_docs = session_data['bi_encoder'].retrieve_top_k(
+                            user_input, 
+                            session_data['embeddings'], 
+                            top_k=retrieval_count
+                        )
+                else:
+                    print("No current project, falling back to dense-only search...")
+                    retrieved_docs = session_data['bi_encoder'].retrieve_top_k(
+                        user_input, 
+                        session_data['embeddings'], 
+                        top_k=retrieval_count
+                    )
+            else:
+                print(f"Dense search - retrieving top {retrieval_count} documents...")
+                retrieved_docs = session_data['bi_encoder'].retrieve_top_k(
+                    user_input, 
+                    session_data['embeddings'], 
+                    top_k=retrieval_count
+                )
+            
+            # Update progress to reranking stage
+            top_n = session_data['cross_encoder_config']['top_n']
+            query_progress_tracker.set_stage("reranking", detail=f"Reranking to top {top_n} documents")
+            print("Reranking documents...")
+            print(f"Reranking to top {top_n} documents...")
+            
+            # Use hybrid reranking if hybrid search is enabled
+            if hybrid_enabled:
+                bm25_weight_rerank = session_data['hybrid_search_config']['bm25_weight_rerank']
+                reranked_docs = session_data['cross_encoder'].rerank(
+                    user_input, 
+                    retrieved_docs, 
+                    top_n=top_n,
+                    hybrid_rerank=True,
+                    bm25_weight=bm25_weight_rerank
+                )
+            else:
+                reranked_docs = session_data['cross_encoder'].rerank(
+                    user_input, 
+                    retrieved_docs, 
+                    top_n=top_n
+                )
+            # Update progress to generating stage
+            query_progress_tracker.set_stage("generating", detail="Generating response with retrieved context")
+            print("Generating response with context...")
+            # Generate response with context
+            context_ids = [doc["original_doc_id"] for doc in reranked_docs]
+            context_texts = [doc["text"] for doc in reranked_docs]
+            context_pages = [doc["page"] for doc in reranked_docs]
+            context_idxs = [doc["chunk_idx"] for doc in reranked_docs]
+            
+            print(reranked_docs)
+            
+            context_texts_pretty = "\\n".join([
+                f"<DOCUMENT{i+1}-{context_idxs[i]}: {context_ids[i]}>\\nTEXT:\\n{text}\\n</DOCUMENT{i+1}-{context_idxs[i]}: {context_ids[i]}>\\n" 
+                for i, text in enumerate(context_texts)
+            ])
+            
+            print(context_texts_pretty)
+            
+            # Track document references
+            personal_stats.track_document_references(context_ids)
+            personal_stats.total_stats['documents_retrieved_total'] += len(context_ids)
+            
+            # Get the selected prompt type and corresponding instructions
+            prompt_type = session_data.get('prompt_type', 'loose')
+            conversation_mode = session_data.get('conversation_mode', 'single')
+            print(f"Using prompt type: {prompt_type}, conversation mode: {conversation_mode}")
+            
+            # Get the selected prompt instructions
+            selected_instructions = PROMPT_INSTRUCTIONS.get(prompt_type, PROMPT_INSTRUCTIONS['loose'])
+            
+            # Build conversation history if in multi-turn mode
+            conversation_history = ""
+            if conversation_mode == 'multi':
+                conversation_history = build_conversation_history(json.dumps(messages[:-1]))  # Exclude current message
+                if conversation_history:
+                    conversation_history = f"""
+            <CONVERSATION_HISTORY>
+            {conversation_history}
+            </CONVERSATION_HISTORY>
+            """
+            
+            rag_prompt = f"""
+            <QUERY>
+            {user_input}
+            </QUERY>
+
+            <INSTRUCTIONS>
+            {selected_instructions}
+            </INSTRUCTIONS>
+            {conversation_history}
+            <DOCUMENTS>
+            {context_texts_pretty}
+            </DOCUMENTS>
+            """
+            
+            print("Invoking LLM for RAG response...")
+            
+            # Start timing response generation
+            response_start_time = time.time()
+            
+            # Handle different LLM types
+            if session_data['llm'] == 'openai':
+                model_name = session_data['llm_config']['model_name']
+                client = session_data['llm_client']
+                
+                # Use proper conversation history format for OpenAI in multi-turn mode
+                if conversation_mode == 'multi':
+                    # Build messages with conversation history
+                    openai_messages = build_openai_conversation_history(json.dumps(messages[:-1]))
+                    
+                    # Create system message with instructions and documents
+                    system_message = f"""
+                    <INSTRUCTIONS>
+                    {selected_instructions}
+                    </INSTRUCTIONS>
+                    
+                    <DOCUMENTS>
+                    {context_texts_pretty}
+                    </DOCUMENTS>
+                    """
+                    
+                    # Insert system message at the beginning
+                    openai_messages.insert(0, {"role": "system", "content": system_message})
+                    
+                    # Add current user query
+                    openai_messages.append({"role": "user", "content": user_input})
+                    
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=openai_messages,
+                        max_tokens=1024,
+                        n=1
+                    )
+                else:
+                    # Single-turn mode - use the current format
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": rag_prompt}],
+                        max_tokens=1024,
+                        n=1
+                    )
+                response_content = response.choices[0].message.content.strip()
+                
+            elif session_data['llm'] == 'gemini':
+                client = session_data['llm_client']
+                response = client.generate_content(rag_prompt)
+                response_content = response.text.strip()
+                
+            else:
+                response = session_data['llm'].invoke(rag_prompt)
+                response_content = response.content.split("</think>")[1] if "</think>" in response.content else response.content
+            
+            # Add project-specific PDF links
+            current_project = session_data.get('current_project', 'default')
+            
+            # Handle both old and new document reference formats
+            for i, doc_name in enumerate(context_ids):
+                # Old format: DOCUMENT1, DOCUMENT2, etc.
+                response_content = response_content.replace(f"DOCUMENT{i+1}",
+                                                            f"<a href='docs_pdf/{current_project}/{doc_name}.pdf#page={context_pages[i]}'>[{i+1}]</a>")
+            
+            # New format: <document_id>X</document_id>
+            doc_id_pattern = r'<document_id>(\\d+)</document_id>'
+            def replace_doc_id(match):
+                doc_num = int(match.group(1))
+                if 1 <= doc_num <= len(context_ids):
+                    doc_name = context_ids[doc_num-1]
+                    return f"<a href='docs_pdf/{current_project}/{doc_name}.pdf#page={context_pages[doc_num-1]}'>[{doc_num}]</a>"
+                return match.group(0)  # Return original if invalid
+            
+            response_content = re.sub(doc_id_pattern, replace_doc_id, response_content)
+            
+            # Calculate response time
+            response_time = time.time() - response_start_time
+            
+            # Track the response
+            personal_stats.track_response(response_content, response_time, success=True)
+            
+        else:
+            # Non-RAG mode: Direct chat without document context
+            conversation_mode = session_data.get('conversation_mode', 'single')
+            
+            # Update progress to generating stage for direct chat
+            query_progress_tracker.set_stage("generating", detail=f"Generating direct response in {conversation_mode} mode")
+            print(f"Generating direct response in {conversation_mode} mode...")
+            
+            # Build conversation history if in multi-turn mode
+            conversation_history = ""
+            if conversation_mode == 'multi':
+                conversation_history = build_conversation_history(json.dumps(messages[:-1]))
+                if conversation_history:
+                    conversation_history = f"""
+            <CONVERSATION_HISTORY>
+            {conversation_history}
+            </CONVERSATION_HISTORY>
+            """
+            
+            chat_prompt = f"""
+            <QUERY>
+            {user_input}
+            </QUERY>
+
+            <INSTRUCTIONS>
+            Provide a helpful and informative response to the user's query.
+            Be concise but thorough in your explanation.
+            </INSTRUCTIONS>
+            {conversation_history}
+            """
+            
+            print("Invoking LLM for direct response...")
+            
+            # Start timing response generation
+            response_start_time = time.time()
+            
+            # Handle different LLM types
+            if session_data['llm'] == 'openai':
+                model_name = session_data['llm_config']['model_name']
+                client = session_data['llm_client']
+                
+                # Use proper conversation history format for OpenAI in multi-turn mode
+                if conversation_mode == 'multi':
+                    # Build messages with conversation history
+                    openai_messages = build_openai_conversation_history(json.dumps(messages[:-1]))
+                    
+                    # Create system message with instructions
+                    system_message = """
+                    <INSTRUCTIONS>
+                    Provide a helpful and informative response to the user's query.
+                    Be concise but thorough in your explanation.
+                    </INSTRUCTIONS>
+                    """
+                    
+                    # Insert system message at the beginning
+                    openai_messages.insert(0, {"role": "system", "content": system_message})
+                    
+                    # Add current user query
+                    openai_messages.append({"role": "user", "content": user_input})
+                    
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=openai_messages,
+                        max_tokens=1024,
+                        n=1
+                    )
+                else:
+                    # Single-turn mode - use the current format
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": chat_prompt}],
+                        max_tokens=1024,
+                        n=1
+                    )
+                response_content = response.choices[0].message.content.strip()
+                
+            elif session_data['llm'] == 'gemini':
+                client = session_data['llm_client']
+                # Gemini uses the text-based conversation history format
+                response = client.generate_content(chat_prompt)
+                response_content = response.text.strip()
+                
+            else:
+                response = session_data['llm'].invoke(chat_prompt)
+                response_content = response.content.split("</think>")[1] if "</think>" in response.content else response.content
+            
+            # Calculate response time
+            response_time = time.time() - response_start_time
+            
+            # Track the response
+            personal_stats.track_response(response_content, response_time, success=True)
+        
+        print("Processing response...")
+        # Add assistant message
+        messages.append({
+            'role': 'assistant',
+            'content': response_content,
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        })
+        
+        # Create chat history display
+        chat_display = []
+        for msg in messages:
+            if msg['role'] == 'user':
+                chat_display.append(
+                    html.Div([
+                        html.Div([
+                            dbc.Card([
+                                dbc.CardBody([
+                                    html.Small(msg['timestamp'], className="text-muted"),
+                                    html.Div(parse_html_content(msg['content']), 
+                                            className="mb-0", 
+                                            style={"whiteSpace": "pre-wrap", "wordWrap": "break-word"})
+                                ])
+                            ], outline=True, className="mb-2", style={"backgroundColor": "#f8f9fa"})
+                        ], style={"display": "inline-block", "maxWidth": "70%", "minWidth": "20%"})
+                    ], style={"textAlign": "right", "marginLeft": "0", "paddingLeft": "25%"})
+                )
+            else:
+                chat_display.append(
+                    dbc.Card([
+                        dbc.CardBody([
+                            html.Small(msg['timestamp'], className="text-muted"),
+                            html.Div(parse_html_content(msg['content']), 
+                                    className="mb-0", 
+                                    style={"whiteSpace": "pre-wrap", "wordWrap": "break-word", "lineHeight": "1.5"})
+                        ])
+                    ], color="secondary", outline=True, className="mb-2")
+                )
+        
+        # Complete query progress tracking
+        query_progress_tracker.complete()
+        
+        print("Chat response generated successfully")
+        return chat_display, json.dumps(messages)
+        
+    except Exception as e:
+        # Reset query progress tracking on error
+        query_progress_tracker.reset()
+        
+        error_msg = f"Error: {str(e)}"
+        print(f"Chat processing error: {error_msg}")
+        
+        # Track the error
+        personal_stats.track_error('query_errors')
+        personal_stats.track_response(error_msg, 0, success=False)
+        
+        messages = json.loads(trigger_data['messages']) if trigger_data.get('messages') else []
+        messages.append({
+            'role': 'assistant',
+            'content': error_msg,
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        })
+        
+        return [dbc.Alert(error_msg, color="danger", dismissable=True)], json.dumps(messages)
 
 # Configuration update callbacks
 @app.callback(
@@ -2906,6 +3596,31 @@ def update_cross_encoder_options(chunk_size):
     return [{'label': str(opt), 'value': opt} for opt in options]
 
 @app.callback(
+    Output('hybrid-search-config', 'data'),
+    [Input('hybrid-search-enabled', 'value'),
+     Input('bm25-weight-input', 'value'),
+     Input('bm25-weight-rerank-input', 'value')]
+)
+def update_hybrid_search_config(enabled_value, bm25_weight, bm25_weight_rerank):
+    if bm25_weight is None or bm25_weight_rerank is None:
+        raise PreventUpdate
+    
+    enabled = 'enabled' in (enabled_value or [])
+    
+    # Update session data
+    print(f"Updating hybrid search configuration: enabled = {enabled}, bm25_weight = {bm25_weight}, bm25_weight_rerank = {bm25_weight_rerank}")
+    session_data['hybrid_search_config'] = {
+        'enabled': enabled,
+        'bm25_weight': float(bm25_weight),
+        'bm25_weight_rerank': float(bm25_weight_rerank)
+    }
+    
+    # Track config change
+    personal_stats.track_config_change()
+    
+    return session_data['hybrid_search_config']
+
+@app.callback(
     Output('llm-model-input', 'value'),
     Input('llm-model-input', 'value'),
     prevent_initial_call=True
@@ -2991,6 +3706,9 @@ def toggle_api_key_input(model_name):
      Output('retrieval-count-select', 'disabled'),
      Output('cross-encoder-model-select', 'disabled'),
      Output('reranking-count-select', 'disabled'),
+     Output('hybrid-search-enabled', 'disabled'),
+     Output('bm25-weight-input', 'disabled'),
+     Output('bm25-weight-rerank-input', 'disabled'),
      Output('check-processed-button', 'disabled', allow_duplicate=True),
      Output('prompt-type-select', 'disabled'),
      Output('conversation-mode-select', 'disabled'),
@@ -3056,6 +3774,9 @@ def control_ui_elements(rag_mode, project_data):
         rag_config_disabled,                    # retrieval-count-select disabled
         rag_config_disabled,                    # cross-encoder-model-select disabled
         rag_config_disabled,                    # reranking-count-select disabled
+        rag_config_disabled,                    # hybrid-search-enabled disabled
+        rag_config_disabled,                    # bm25-weight-input disabled
+        rag_config_disabled,                    # bm25-weight-rerank-input disabled
         upload_disabled,                        # check-processed-button disabled
         rag_config_disabled,                    # prompt-type-select disabled
         conversation_mode_disabled,             # conversation-mode-select disabled
@@ -3085,7 +3806,7 @@ def update_prompt_type(prompt_type):
         'simple': "Simple: Document-focused with minimal constraints on knowledge usage."
     }
     
-    explainer_text = explainers.get(prompt_type, explainers['strict'])
+    explainer_text = explainers.get(prompt_type, explainers['loose'])
     
     return prompt_type, explainer_text
 

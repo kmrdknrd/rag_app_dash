@@ -1,4 +1,4 @@
-# 8devices RAG Chatbot (v.0.4.1)
+# 8devices RAG Chatbot (v0.5.0)
 
 A powerful Retrieval-Augmented Generation (RAG) chatbot application built with Dash that allows users to upload PDF documents and ask questions about them using local AI models or cloud APIs. Features complete project management, multi-model support, enhanced conversational capabilities, comprehensive usage analytics, and advanced progress tracking.
 
@@ -274,6 +274,7 @@ The modular design allows easy extension of:
 
 ### Key Files
 - `app.py` - Main application file
+- `page_aware_chunker.py` - Page-aware chunking
 - `CLAUDE.md` - Development guidelines and architecture documentation
 - `app_log.txt` - Application logs
 - `projects/` - Project data storage
@@ -284,7 +285,18 @@ This project is in active development. For feedback and contributions, contact: 
 
 ## Changelog
 
-### v0.4.2 (Current)
+### v0.5.0 (Current)
+- **NEW**: Page-aware chunking with page numbers
+- **NEW**: embed_page_aware_documents() method for processing page chunk objects
+- **NEW**: Backward compatibility with original embed_documents() method
+- **NEW**: Enhanced document linking with page numbers
+- **NEW**: BM25 corpus creation and loading functions
+- **NEW**: Hybrid search mode with BM25 and reranking
+- **IMPROVED**: Retrieval combines dense embeddings with sparse keyword matching
+- **IMPROVED**: Fallback mechanisms for chunk positioning when text search fails
+- **FIXED**: Embedding loading uses disk-based retrieval instead of re-processing in all cases
+
+### v0.4.2
 - **FIXED**: Fixed the issue with automatic port allocation
 
 ### v0.4.1
