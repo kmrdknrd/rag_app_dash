@@ -46,7 +46,6 @@ import google.generativeai as genai
 
 session_data = {
     'embeddings': [],
-    'docs_md': [],
     'doc_paths': [],
     'pdf_processor': None,
     'bi_encoder': None,
@@ -984,6 +983,149 @@ def build_openai_conversation_history(messages_json, max_turns=8):
     except:
         return []
 
+def build_gemini_conversation_history(messages_json, max_turns=8):
+    """Build Gemini-formatted conversation history from messages JSON, limited to avoid token limits"""
+    try:
+        messages = json.loads(messages_json)
+        
+        # Get the most recent messages (excluding the current user input which will be added later)
+        # Use max_turns*2 because each turn has both user and assistant messages
+        recent_messages = messages[-max_turns*2:] if len(messages) > max_turns*2 else messages
+        
+        # Build Gemini chat history format
+        gemini_history = []
+        for msg in recent_messages:
+            if msg['role'] == 'user':
+                gemini_history.append({
+                    "role": "user",
+                    "parts": [{"text": msg['content']}]
+                })
+            else:
+                gemini_history.append({
+                    "role": "model", 
+                    "parts": [{"text": msg['content']}]
+                })
+        
+        return gemini_history
+    except:
+        return []
+
+def collect_feedback_information(user_query, llm_response, user_comment, retrieved_chunks=None):
+    """Collect comprehensive feedback information for sharing"""
+    
+    # Current timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Get current project and RAG configuration
+    current_project = session_data.get('current_project', 'No project selected')
+    rag_config = session_data.get('bi_encoder_config', {})
+    cross_encoder_config = session_data.get('cross_encoder_config', {})
+    llm_config = session_data.get('llm_config', {})
+    hybrid_config = session_data.get('hybrid_search_config', {})
+    
+    # Get project documents information
+    documents_info = "No documents information available"
+    embedding_status = "No embedding information available"
+    
+    if current_project and current_project != 'No project selected':
+        try:
+            # Get project directories
+            project_dirs = get_project_directories(session_data.get('dir', './projects'), current_project)
+            pdf_dir = project_dirs['docs_pdf']
+            
+            # List PDF files
+            pdf_files = []
+            if os.path.exists(pdf_dir):
+                pdf_files = [f for f in os.listdir(pdf_dir) if f.endswith('.pdf')]
+            
+            documents_info = f"Project: {current_project}\nPDF files ({len(pdf_files)}): {', '.join(pdf_files) if pdf_files else 'None'}"
+            
+            # Check embedding status
+            embeddings_exist = len(session_data.get('embeddings', [])) > 0
+            embedding_status = f"Embeddings loaded: {'Yes' if embeddings_exist else 'No'}"
+            if embeddings_exist:
+                embedding_status += f" ({len(session_data['embeddings'])} chunks)"
+            
+        except Exception as e:
+            documents_info = f"Error retrieving document info: {str(e)}"
+    
+    # Format retrieved chunks information
+    chunks_info = "No chunks retrieved (direct chat mode)"
+    if retrieved_chunks:
+        chunks_info = f"Retrieved {len(retrieved_chunks)} chunks:\n"
+        for i, chunk in enumerate(retrieved_chunks[:10], 1):  # Limit to first 10 chunks
+            chunk_preview = chunk[:200] + "..." if len(chunk) > 200 else chunk
+            chunks_info += f"\nChunk {i}:\n{chunk_preview}\n"
+        if len(retrieved_chunks) > 10:
+            chunks_info += f"\n... and {len(retrieved_chunks) - 10} more chunks"
+    
+    # Create comprehensive feedback text
+    feedback_text = f"""
+=== RAG CHATBOT FEEDBACK REPORT ===
+Generated: {timestamp}
+
+=== USER FEEDBACK ===
+{user_comment}
+
+=== USER QUERY ===
+{user_query}
+
+=== LLM RESPONSE ===
+{llm_response}
+
+=== RAG CONFIGURATION ===
+Bi-Encoder Model: {rag_config.get('model_name', 'Not set')}
+Chunk Size: {rag_config.get('chunk_size', 'Not set')}
+Chunk Overlap: {rag_config.get('chunk_overlap', 'Not set')}
+Retrieval Count: {rag_config.get('retrieval_count', 'Not set')}
+
+Cross-Encoder Model: {cross_encoder_config.get('model_name', 'Not set')}
+Reranking Count: {cross_encoder_config.get('top_n', 'Not set')}
+
+LLM Model: {llm_config.get('model_name', 'Not set')}
+
+Hybrid Search Enabled: {hybrid_config.get('enabled', False)}
+BM25 Weight: {hybrid_config.get('bm25_weight', 'Not set')}
+BM25 Rerank Weight: {hybrid_config.get('bm25_weight_rerank', 'Not set')}
+
+=== PROJECT DOCUMENTS ===
+{documents_info}
+
+=== EMBEDDING STATUS ===
+{embedding_status}
+
+=== RERANKED CHUNKS ===
+{chunks_info}
+
+=== SYSTEM INFO ===
+RAG Mode: {session_data.get('rag_mode', 'Unknown')}
+Prompt Type: {session_data.get('prompt_type', 'Unknown')}
+Conversation Mode: {session_data.get('conversation_mode', 'Unknown')}
+"""
+    
+    return feedback_text
+
+def save_feedback_to_file(feedback_text):
+    """Save feedback text to a timestamped .txt file"""
+    try:
+        # Create feedback directory if it doesn't exist
+        feedback_dir = os.path.join(session_data.get('dir', './'), 'feedback')
+        os.makedirs(feedback_dir, exist_ok=True)
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"feedback_{timestamp}.txt"
+        filepath = os.path.join(feedback_dir, filename)
+        
+        # Write feedback to file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(feedback_text)
+        
+        return filepath
+    except Exception as e:
+        print(f"Error saving feedback: {str(e)}")
+        return None
+
 # Enhanced PDF processor with progress tracking
 class PdfProcessor:
     def __init__(self, converter="docling"):
@@ -1001,9 +1143,11 @@ class PdfProcessor:
     def process_document(self,
                          doc_path,
                          save_path=None, 
-                         chunk_size=session_data['bi_encoder_config']['chunk_size'], 
-                         chunk_overlap=session_data['bi_encoder_config']['chunk_overlap']):
-        """Process document using pre-loaded model with progress tracking and page-aware chunking"""
+                         chunk_size=None, 
+                         chunk_overlap=None,
+                         embeddings_path=None,
+                         model_name=None):
+        """Process document using PKL-based caching instead of .md files"""
         # Check if path is to a single file or a directory
         # Process a single file or all files in a directory
         all_texts = []
@@ -1016,12 +1160,6 @@ class PdfProcessor:
             # Use the file directly if it's a single file, otherwise get all PDFs in directory
             files = [doc_path] if doc_path.is_file() else list(doc_path.glob("*.pdf"))
         
-        if save_path is not None:
-            if not os.path.exists(save_path):
-                # Create save path if it doesn't exist
-                progress_tracker.log_message(f"Creating save directory: {save_path}")
-                os.makedirs(save_path)
-        
         # Process each file
         for i, file in enumerate(files):
             # Get file name for URL or path
@@ -1030,19 +1168,37 @@ class PdfProcessor:
             else:
                 file_stem = file.stem
             
-            # Skip if file already processed
-            if save_path is not None and os.path.exists(save_path / f"{file_stem}.md"):
-                progress_tracker.log_message(f"Skipping {file_stem} because .md already exists")
-                # Load .md from disk
-                with open(save_path / f"{file_stem}.md", "r") as f:
-                    text = f.read()
-                all_texts.append(text)
-                
-                # For skipped files, we need to create page chunks from the saved text
-                # This is a fallback - ideally we'd save page chunks too
-                progress_tracker.log_message(f"Creating page-aware chunks for pre-processed {file_stem}")
-                page_chunks, _ = chunk_pdf_with_pages(str(file), chunk_size, chunk_overlap)
-                all_page_chunks.append(page_chunks)
+            # Use provided chunk_size and chunk_overlap, or fall back to session defaults
+            if chunk_size is None:
+                chunk_size = session_data['bi_encoder_config']['chunk_size']
+            if chunk_overlap is None:
+                chunk_overlap = session_data['bi_encoder_config']['chunk_overlap']
+            
+            # Check if PKL files already exist for this document with current configuration
+            skip_processing = False
+            if embeddings_path and model_name:
+                # Build the configuration-specific PKL path
+                pkl_path = Path(embeddings_path) / model_name.split("/")[-1] / f"chunk_size_{chunk_size}" / f"chunk_overlap_{chunk_overlap}" / file_stem
+                if pkl_path.exists():
+                    chunk_files = list(pkl_path.glob("chunk_*.pkl"))
+                    if chunk_files:
+                        progress_tracker.log_message(f"Skipping {file_stem} - PKL embeddings already exist for current config ({len(chunk_files)} chunks)")
+                        # Load page chunks from existing PKL files
+                        page_chunks = []
+                        for chunk_file in sorted(chunk_files):
+                            with open(chunk_file, "rb") as f:
+                                chunk_data = pickle.load(f)
+                                page_chunks.append({
+                                    'text': chunk_data['text'],
+                                    'page': chunk_data['page']
+                                })
+                        all_page_chunks.append(page_chunks)
+                        # Reconstruct full text from chunks
+                        full_text = '\n\n'.join([chunk['text'] for chunk in page_chunks])
+                        all_texts.append(full_text)
+                        skip_processing = True
+            
+            if skip_processing:
                 continue
             
             progress_tracker.log_message(f"Processing {file_stem} ({i+1}/{len(files)})")
@@ -1063,10 +1219,6 @@ class PdfProcessor:
                 page_chunks, full_text = chunk_pdf_with_pages(str(file), chunk_size, chunk_overlap)
                 all_texts.append(full_text)
                 all_page_chunks.append(page_chunks)
-            
-            if save_path is not None:  # save to .md's
-                with open(save_path / f"{file_stem}.md", "w") as f:
-                    f.write(all_texts[-1])
         
         # For single files, return the text and page chunks as lists with one item
         is_single_file = (isinstance(doc_path, str) and (doc_path.startswith('http://') or doc_path.startswith('https://'))) or \
@@ -1332,10 +1484,20 @@ class CrossEncoderPipeline:
             
         print(f"Initializing CrossEncoderPipeline with model: {model_name}")
         self.model_name = model_name
-        self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+        # Auto-detect best available device
+        if device:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"  
+        else:
+            self.device = "cpu"
         
         if "mxbai" in model_name:
-            self.model = MxbaiRerankV2(model_name, device="cpu")
+            # MxbaiRerankV2 crashes on MPS, so use CPU for MPS but allow CUDA
+            mxbai_device = "cpu" if self.device == "mps" else self.device
+            self.model = MxbaiRerankV2(model_name, device=mxbai_device)
             self.model_type = "mxbai"
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -1462,13 +1624,14 @@ Reference the IDs of the DOCUMENTS in your response in the format <DOCUMENT1: ID
 }
 
 # Startup message
-startup_message = f"""Naudojatės 8devices RAG Chatbot (v0.5.0).
+startup_message = f"""Naudojatės 8devices RAG Chatbot (v0.5.1).
 Turėkit omeny, kad ši aplikacija yra alfa versijoje, ir yra greitai atnaujinama. Dabartinis tikslas yra parodyti, kaip galima naudoti Retrieval-Augmented Generation (RAG) su PDF dokumentais, kad praturtinti LLM atsakymus. Visi modeliai yra lokalūs, ir dokumentai yra išsaugomi jūsų kompiuteryje, tad jūsų duomenys nėra perduodami jokiam serveriui. Dėl to, ši aplikacija veikia lėtai.
 
 NAUJA:
 - Hyperlinks į LLM atsakymuose naudotų šaltinių konkrečius puslapius
 - Hibridinė dokumentų paieška su raktažodžiais (BM25)
 - UI atnaujinimas
+- LLM atsakymų dalinimosi sistema - kiekvienas atsakymas turi po dalinimosi mygtuką, kurį paspaudus atsiveria langas, kur vartotojas gali pateikti atsiliepimą apie atsakymą
 
 ANKSČIAU: 
 - Išsami asmeninio naudojimo statistika ir analitika
@@ -1483,7 +1646,6 @@ GREITAI:
 - LLM atsakymų streaming
 - Test režimas
 - Citation highlighting šaltiniuose
-- Dalinimosi mygtukai
 """
 startup_success = True
 
@@ -1491,7 +1653,7 @@ startup_success = True
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
-            html.H1("8devices RAG Chatbot (v0.5.0)", className="text-center mb-2 mt-2"),
+            html.H1("8devices RAG Chatbot (v0.5.1)", className="text-center mb-2 mt-2"),
             html.Hr()
         ])
     ]),
@@ -1751,6 +1913,10 @@ app.layout = dbc.Container([
                             ])
                         ])
                     ], id="query-progress-container", style={'display': 'none', 'margin-bottom': '10px'}),
+                    
+                    # Feedback status area
+                    html.Div(id="feedback-global-status", children="", style={'margin-bottom': '10px'}),
+                    
                     html.Div(id='chat-history', style={
                         'height': '400px',
                         'overflowY': 'auto',
@@ -2059,6 +2225,40 @@ app.layout = dbc.Container([
         ])
     ], id="rag-config-modal", size="lg", is_open=False),
     
+    # Feedback Modal
+    dbc.Modal([
+        dbc.ModalHeader([
+            dbc.ModalTitle("Create Response Feedback")
+        ]),
+        dbc.ModalBody([
+            html.Div(id="feedback-status", children=""),
+            html.H6("Please provide feedback on what's wrong with this response:"),
+            dbc.Textarea(
+                id="feedback-comment",
+                placeholder="Describe what's wrong with the response, what you expected, or any other feedback...",
+                rows=4,
+                style={"margin-bottom": "15px"}
+            ),
+            html.Hr(),
+            html.H6("Technical Information (automatically included):"),
+            html.Div([
+                html.P("✓ User query", className="mb-1"),
+                html.P("✓ LLM response", className="mb-1"),
+                html.P("✓ Current RAG configuration", className="mb-1"),
+                html.P("✓ Documents in project", className="mb-1"),
+                html.P("✓ Embedding status", className="mb-1"),
+                html.P("✓ Retrieved chunks", className="mb-1"),
+            ], style={"font-size": "14px", "color": "#666"})
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id="cancel-feedback-button", color="secondary", className="me-2"),
+            dbc.Button("Create Feedback", id="submit-feedback-button", color="primary")
+        ])
+    ], id="feedback-modal", size="lg", is_open=False),
+    
+    # Hidden divs to store feedback data
+    html.Div(id="feedback-data", style={"display": "none"}),
+    
 ], fluid=True)
 
 # Enhanced callback for progress tracking
@@ -2237,7 +2437,6 @@ def select_project(selected_project):
         
         # Clear previous session data when switching projects
         session_data['embeddings'] = []
-        session_data['docs_md'] = []
         session_data['doc_paths'] = []
         session_data['bi_encoder'] = None
         session_data['cross_encoder'] = None
@@ -2306,7 +2505,6 @@ def delete_selected_project(n_clicks, selected_project):
         # Clear session data
         session_data['current_project'] = None
         session_data['embeddings'] = []
-        session_data['docs_md'] = []
         session_data['doc_paths'] = []
         session_data['bi_encoder'] = None
         session_data['cross_encoder'] = None
@@ -2430,11 +2628,10 @@ def check_processed_pdfs(n_clicks, project_data):
         # Get project-specific directories
         project_dirs = get_project_directories(session_data['dir'], current_project)
         docs_dir = project_dirs['docs_pdf']
-        processed_dir = project_dirs['docs_md']
         embeddings_dir = project_dirs['embeddings']
         
         # Check if directories exist
-        if not docs_dir.exists() or not processed_dir.exists() or not embeddings_dir.exists():
+        if not docs_dir.exists() or not embeddings_dir.exists():
             print("No processed documents found - directories don't exist")
             check_progress_tracker.reset()
             return (
@@ -2458,138 +2655,69 @@ def check_processed_pdfs(n_clicks, project_data):
                 'idle'
             )
         
-        # Check if markdown files exist for all PDFs, and process missing ones
-        processed_docs = []
+        # Configuration-specific PKL check - only load documents that match current config
         doc_ids = []
-        missing_md = []
+        docs_needing_processing = []
+        
+        # Build the configuration-specific embeddings path
+        embeddings_path = embeddings_dir / model_name / f"chunk_size_{chunk_size}" / f"chunk_overlap_{chunk_overlap}"
+        
+        print(f"Checking for embeddings with current configuration: {model_name}, chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
         
         for pdf_file in pdf_files:
-            md_file = processed_dir / f"{pdf_file.stem}.md"
-            if md_file.exists():
-                with open(md_file, 'r') as f:
-                    processed_docs.append(f.read())
-                doc_ids.append(pdf_file.stem)
-            else:
-                missing_md.append(pdf_file.stem)
-        
-        # If there are missing markdown files, process them automatically
-        if missing_md:
-            print(f"Found PDFs without markdown files: {missing_md}. Processing them now...")
+            doc_embedding_dir = embeddings_path / pdf_file.stem
             
-            # Process the missing PDFs
-            for pdf_stem in missing_md:
+            # Only consider documents processed if they exist for the CURRENT configuration
+            if doc_embedding_dir.exists():
+                chunk_files = list(doc_embedding_dir.glob("chunk_*.pkl"))
+                if chunk_files:
+                    print(f"Found existing embeddings for {pdf_file.stem} with current configuration")
+                    doc_ids.append(pdf_file.stem)
+                else:
+                    print(f"Found embedding directory for {pdf_file.stem} but no chunk files - needs reprocessing")
+                    docs_needing_processing.append(pdf_file.stem)
+            else:
+                print(f"No embeddings found for {pdf_file.stem} with current configuration - needs processing")
+                docs_needing_processing.append(pdf_file.stem)
+        
+        # Process any documents that don't have embeddings for the current configuration
+        if docs_needing_processing:
+            print(f"Processing {len(docs_needing_processing)} PDFs for current configuration: {docs_needing_processing}")
+            
+            for pdf_stem in docs_needing_processing:
                 pdf_file = docs_dir / f"{pdf_stem}.pdf"
                 if pdf_file.exists():
-                    print(f"Processing {pdf_stem}...")
+                    print(f"Processing {pdf_stem} with current configuration...")
                     
                     try:
-                        # Process the PDF
-                        processed_text = session_data['pdf_processor'].process_document(
+                        # Process the PDF - will be chunked according to current config
+                        processed_text, _ = session_data['pdf_processor'].process_document(
                             pdf_file, 
-                            save_path=processed_dir
+                            save_path=None,  # No .md files needed
+                            embeddings_path=embeddings_dir,
+                            model_name=config['model_name'],
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap
                         )
                         
-                        # Add to processed docs
+                        # Add to doc IDs
                         if processed_text:
-                            processed_docs.extend(processed_text)
                             doc_ids.append(pdf_stem)
-                            print(f"Successfully processed {pdf_stem}")
+                            print(f"Successfully processed {pdf_stem} with current configuration")
                         
                     except Exception as e:
                         print(f"Error processing {pdf_stem}: {str(e)}")
                         personal_stats.track_error('processing_errors')
                         continue
             
-            print(f"Completed processing {len(missing_md)} PDFs")
+            print(f"Completed processing {len(docs_needing_processing)} PDFs for current configuration")
         
-        # Check if embeddings exist for current configuration
-        embeddings_path = embeddings_dir / model_name / f"chunk_size_{chunk_size}" / f"chunk_overlap_{chunk_overlap}"
+        # All documents in doc_ids now have been processed for the current configuration
+        # Any missing embeddings will be created automatically by the embedding system
+        # based on configuration-specific paths
         
-        if not embeddings_path.exists():
-            print(f"No embeddings found for current configuration at {embeddings_path}")
-            check_progress_tracker.reset()
-            return (
-                dbc.Alert("No embeddings found for current configuration. Please upload PDFs to process them.", color="warning", dismissable=True),
-                'idle'
-            )
-        
-        # Check if all documents have embeddings, and create missing ones
-        missing_embeddings = []
-        for doc_id in doc_ids:
-            doc_embedding_dir = embeddings_path / doc_id
-            if not doc_embedding_dir.exists():
-                missing_embeddings.append(doc_id)
-            else:
-                # Check if at least one chunk file exists
-                chunk_files = list(doc_embedding_dir.glob("chunk_*.pkl"))
-                if not chunk_files:
-                    missing_embeddings.append(doc_id)
-        
-        # If there are missing embeddings, create them automatically
-        if missing_embeddings:
-            print(f"Found documents without embeddings: {missing_embeddings}. Creating embeddings now...")
-            
-            # Initialize models if needed
-            if session_data['bi_encoder'] is None:
-                print("Initializing bi-encoder...")
-                session_data['bi_encoder'] = BiEncoderPipeline(
-                    model_name=config['model_name'],
-                    chunk_size=config['chunk_size'],
-                    chunk_overlap=config['chunk_overlap']
-                )
-                print("Bi-encoder initialized")
-            
-            if session_data['cross_encoder'] is None:
-                print("Initializing cross-encoder...")
-                cross_encoder_config = session_data['cross_encoder_config']
-                session_data['cross_encoder'] = CrossEncoderPipeline(
-                    model_name=cross_encoder_config['model_name']
-                )
-                print("Cross-encoder initialized")
-            
-            # Prepare documents for embedding with page awareness
-            page_chunks_to_embed = []
-            doc_ids_to_embed = []
-            
-            for doc_id in missing_embeddings:
-                pdf_file = docs_dir / f"{doc_id}.pdf"
-                if pdf_file.exists():
-                    # Get page chunks directly from PDF
-                    _, page_chunks_list = session_data['pdf_processor'].process_document(
-                        pdf_file,
-                        save_path=None  # Don't save again, just get page chunks
-                    )
-                    page_chunks_to_embed.extend(page_chunks_list)
-                    doc_ids_to_embed.extend([doc_id] * len(page_chunks_list))
-                    print(f"Prepared {doc_id} for embedding ({len(page_chunks_list)} chunks)")
-                else:
-                    print(f"Warning: PDF file not found for {doc_id}")
-            
-            # Create embeddings for missing documents
-            if page_chunks_to_embed:
-                print(f"Creating embeddings for {len(page_chunks_to_embed)} chunks from {len(missing_embeddings)} documents...")
-                
-                try:
-                    # Create embeddings with page awareness
-                    new_embeddings = session_data['bi_encoder'].embed_page_aware_documents(
-                        page_chunks_to_embed,
-                        doc_ids=doc_ids_to_embed,
-                        save_path=embeddings_dir,
-                        track_progress=False
-                    )
-                    
-                    print(f"Successfully created embeddings for {len(missing_embeddings)} documents")
-                    
-                except Exception as e:
-                    print(f"Error creating embeddings: {str(e)}")
-                    personal_stats.track_error('processing_errors')
-                    check_progress_tracker.reset()
-                    return (
-                        dbc.Alert(f"Error creating embeddings: {str(e)}", color="danger", dismissable=True),
-                        'error'
-                    )
-            
-            print(f"Completed embedding creation for {len(missing_embeddings)} documents")
+        # Configuration-specific processing above ensures all documents are properly processed
+        # No additional embedding creation needed since we use configuration-specific paths
         
         print(f"Found processed documents: {doc_ids}")
         check_progress_tracker.set_step(2, "Found processed documents", f"Found {len(doc_ids)} documents")
@@ -2640,7 +2768,6 @@ def check_processed_pdfs(n_clicks, project_data):
                         
         print(f"Loaded {len(embeddings)} embeddings from disk")
         session_data['embeddings'] = embeddings
-        session_data['docs_md'] = processed_docs
         session_data['doc_paths'] = doc_ids
         
         # Create BM25 corpus for hybrid search
@@ -2671,29 +2798,17 @@ def check_processed_pdfs(n_clicks, project_data):
         # Create success message based on what happened
         message_parts = []
         
-        if missing_md and missing_embeddings:
-            # Both PDF processing and embedding creation happened
-            pdf_processed = len([doc for doc in missing_md if doc in doc_ids])
-            embeddings_created = len(missing_embeddings)
+        if docs_needing_processing:
+            # Some PDFs were processed for current configuration
+            pdf_processed = len([doc for doc in docs_needing_processing if doc in doc_ids])
             existing_docs = len(doc_ids) - pdf_processed
-            message_parts.append(f"Found {existing_docs} existing documents")
-            message_parts.append(f"processed {pdf_processed} additional PDFs")
-            message_parts.append(f"created embeddings for {embeddings_created} documents")
-        elif missing_md:
-            # Only PDF processing happened
-            pdf_processed = len([doc for doc in missing_md if doc in doc_ids])
-            existing_docs = len(doc_ids) - pdf_processed
-            message_parts.append(f"Found {existing_docs} existing documents")
-            message_parts.append(f"processed {pdf_processed} additional PDFs")
-        elif missing_embeddings:
-            # Only embedding creation happened
-            embeddings_created = len(missing_embeddings)
-            existing_docs = len(doc_ids) - embeddings_created
-            message_parts.append(f"Found {existing_docs} existing documents")
-            message_parts.append(f"created embeddings for {embeddings_created} documents")
+            if existing_docs > 0:
+                message_parts.append(f"Found {existing_docs} documents with current configuration")
+            message_parts.append(f"processed {pdf_processed} PDFs for current configuration (chunk_size={chunk_size}, chunk_overlap={chunk_overlap})")
         else:
-            # No processing needed - just show progress briefly and complete
-            message_parts.append(f"Found and loaded {len(doc_ids)} processed documents")
+            # No processing needed - all documents already exist for current configuration
+            message_parts.append(f"Found and loaded {len(doc_ids)} documents with current configuration")
+            message_parts.append(f"(chunk_size={chunk_size}, chunk_overlap={chunk_overlap})")
         
         success_msg = ", ".join(message_parts) + f". Loaded {len(doc_ids)} total documents. Ready to chat!"
         
@@ -2746,11 +2861,10 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
         # Get project-specific directories
         project_dirs = get_project_directories(session_data['dir'], current_project)
         docs_dir = project_dirs['docs_pdf']
-        processed_dir = project_dirs['docs_md']
         embeddings_dir = project_dirs['embeddings']
         
         # Create directories
-        for d in [docs_dir, processed_dir, embeddings_dir]:
+        for d in [docs_dir, embeddings_dir]:
             if not d.exists():
                 d.mkdir(parents=True)
         
@@ -2785,18 +2899,17 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
         
         # Process each PDF
         for i, pdf_file in enumerate(pdf_files):
-            if not (processed_dir / f"{pdf_file.stem}.md").exists():
-                progress_tracker.increment_stage_progress(pdf_file.stem)
-                
-                # Get both texts and page chunks 
-                # Note: We could skip saving markdown files since we use page chunks directly
-                texts, page_chunks_list = session_data['pdf_processor'].process_document(
-                    pdf_file, 
-                    save_path=processed_dir  # Still save for debugging/inspection
-                )
-                session_data['docs_md'].extend(texts)
-            else:
-                progress_tracker.increment_stage_progress(f"{pdf_file.stem} (skipped)")
+            progress_tracker.increment_stage_progress(pdf_file.stem)
+            
+            # Get both texts and page chunks using PKL-based caching
+            texts, page_chunks_list = session_data['pdf_processor'].process_document(
+                pdf_file, 
+                save_path=None,  # No .md files needed
+                embeddings_path=embeddings_dir,
+                model_name=session_data['bi_encoder_config']['model_name'],
+                chunk_size=session_data['bi_encoder_config']['chunk_size'],
+                chunk_overlap=session_data['bi_encoder_config']['chunk_overlap']
+            )
         
         # Stage 3: Initialize embedder
         progress_tracker.set_stage("embedding_init", 1)
@@ -2830,10 +2943,14 @@ def handle_enhanced_file_upload(contents, filenames, project_data):
         
         if pdf_files:
             for pdf_file in pdf_files:
-                # Get page chunks directly from PDF
+                # Get page chunks directly from PDF using PKL-based caching
                 _, page_chunks_list = session_data['pdf_processor'].process_document(
                     pdf_file,
-                    save_path=None  # Don't save again, just get page chunks
+                    save_path=None,  # No .md files needed
+                    embeddings_path=embeddings_dir,
+                    model_name=session_data['bi_encoder_config']['model_name'],
+                    chunk_size=session_data['bi_encoder_config']['chunk_size'],
+                    chunk_overlap=session_data['bi_encoder_config']['chunk_overlap']
                 )
                 all_page_chunks.extend(page_chunks_list)
                 doc_ids.extend([pdf_file.stem] * len(page_chunks_list))
@@ -2921,7 +3038,7 @@ def handle_user_input(n_clicks, n_submit, clear_clicks, user_input, messages_jso
         session_data['conversation_history'] = []
         # Reset query progress when clearing chat
         query_progress_tracker.reset()
-        return [], "[]", ""
+        return [], "[]", "", None
     
     # Handle send message
     if button_id in ['send-button', 'user-input'] and user_input:
@@ -3019,10 +3136,24 @@ def handle_user_input(n_clicks, n_submit, clear_clicks, user_input, messages_jso
                         ], style={"textAlign": "right", "marginLeft": "0", "paddingLeft": "25%"})
                     )
                 else:
+                    # Generate unique ID for this message based on timestamp and content hash
+                    msg_id = f"msg_{hash(msg['content'] + msg['timestamp'])}"
                     chat_display.append(
                         dbc.Card([
                             dbc.CardBody([
-                                html.Small(msg['timestamp'], className="text-muted"),
+                                html.Div([
+                                    html.Small(msg['timestamp'], className="text-muted"),
+                                    dbc.Button(
+                                        "📤",
+                                        id={"type": "share-button", "index": msg_id},
+                                        size="sm",
+                                        color="light",
+                                        outline=True,
+                                        className="float-end",
+                                        style={"fontSize": "12px", "padding": "2px 6px", "marginTop": "-2px"},
+                                        title="Create feedback about this response"
+                                    )
+                                ], className="d-flex justify-content-between align-items-center"),
                                 html.Div(parse_html_content(msg['content']), 
                                         className="mb-0", 
                                         style={"whiteSpace": "pre-wrap", "wordWrap": "break-word", "lineHeight": "1.5"})
@@ -3222,6 +3353,10 @@ def handle_chat_processing(trigger_data):
             context_pages = [doc["page"] for doc in reranked_docs]
             context_idxs = [doc["chunk_idx"] for doc in reranked_docs]
             
+            # Store retrieved chunks for feedback (store last query's chunks)
+            session_data['last_retrieved_chunks'] = context_texts
+            session_data['last_user_query'] = user_input
+            
             print(reranked_docs)
             
             context_texts_pretty = "\\n".join([
@@ -3318,8 +3453,34 @@ def handle_chat_processing(trigger_data):
                 
             elif session_data['llm'] == 'gemini':
                 client = session_data['llm_client']
-                response = client.generate_content(rag_prompt)
-                response_content = response.text.strip()
+                
+                # Use proper conversation history format for Gemini in multi-turn mode
+                if conversation_mode == 'multi':
+                    # Build Gemini chat history
+                    gemini_history = build_gemini_conversation_history(json.dumps(messages[:-1]))
+                    
+                    # Create system instruction with RAG prompt components
+                    system_instruction = f"""
+                    <INSTRUCTIONS>
+                    {selected_instructions}
+                    </INSTRUCTIONS>
+                    
+                    <DOCUMENTS>
+                    {context_texts_pretty}
+                    </DOCUMENTS>
+                    """
+                    
+                    # Start a chat with history for multi-turn conversation
+                    chat = client.start_chat(history=gemini_history)
+                    
+                    # Generate response with current query and system context
+                    full_prompt = f"{system_instruction}\n\n<QUERY>\n{user_input}\n</QUERY>"
+                    response = chat.send_message(full_prompt)
+                    response_content = response.text.strip()
+                else:
+                    # Single-turn mode - use the current format
+                    response = client.generate_content(rag_prompt)
+                    response_content = response.text.strip()
                 
             else:
                 response = session_data['llm'].invoke(rag_prompt)
@@ -3354,6 +3515,10 @@ def handle_chat_processing(trigger_data):
         else:
             # Non-RAG mode: Direct chat without document context
             conversation_mode = session_data.get('conversation_mode', 'single')
+            
+            # Clear retrieved chunks for feedback (no RAG context)
+            session_data['last_retrieved_chunks'] = None
+            session_data['last_user_query'] = user_input
             
             # Update progress to generating stage for direct chat
             query_progress_tracker.set_stage("generating", detail=f"Generating direct response in {conversation_mode} mode")
@@ -3429,9 +3594,31 @@ def handle_chat_processing(trigger_data):
                 
             elif session_data['llm'] == 'gemini':
                 client = session_data['llm_client']
-                # Gemini uses the text-based conversation history format
-                response = client.generate_content(chat_prompt)
-                response_content = response.text.strip()
+                
+                # Use proper conversation history format for Gemini in multi-turn mode
+                if conversation_mode == 'multi':
+                    # Build Gemini chat history
+                    gemini_history = build_gemini_conversation_history(json.dumps(messages[:-1]))
+                    
+                    # Create system instruction for direct chat
+                    system_instruction = """
+                    <INSTRUCTIONS>
+                    Provide a helpful and informative response to the user's query.
+                    Be concise but thorough in your explanation.
+                    </INSTRUCTIONS>
+                    """
+                    
+                    # Start a chat with history for multi-turn conversation
+                    chat = client.start_chat(history=gemini_history)
+                    
+                    # Generate response with current query and system context
+                    full_prompt = f"{system_instruction}\n\n<QUERY>\n{user_input}\n</QUERY>"
+                    response = chat.send_message(full_prompt)
+                    response_content = response.text.strip()
+                else:
+                    # Single-turn mode - use the current format
+                    response = client.generate_content(chat_prompt)
+                    response_content = response.text.strip()
                 
             else:
                 response = session_data['llm'].invoke(chat_prompt)
@@ -3470,10 +3657,24 @@ def handle_chat_processing(trigger_data):
                     ], style={"textAlign": "right", "marginLeft": "0", "paddingLeft": "25%"})
                 )
             else:
+                # Generate unique ID for this message based on timestamp and content hash
+                msg_id = f"msg_{hash(msg['content'] + msg['timestamp'])}"
                 chat_display.append(
                     dbc.Card([
                         dbc.CardBody([
-                            html.Small(msg['timestamp'], className="text-muted"),
+                            html.Div([
+                                html.Small(msg['timestamp'], className="text-muted"),
+                                dbc.Button(
+                                    "Share feedback 📤",
+                                    id={"type": "share-button", "index": msg_id},
+                                    size="md",
+                                    color="light",
+                                    outline=True,
+                                    className="float-end",
+                                    style={"fontSize": "12px", "padding": "2px 6px", "marginTop": "-2px"},
+                                    title="Create feedback about this response"
+                                )
+                            ], className="d-flex justify-content-between align-items-center"),
                             html.Div(parse_html_content(msg['content']), 
                                     className="mb-0", 
                                     style={"whiteSpace": "pre-wrap", "wordWrap": "break-word", "lineHeight": "1.5"})
@@ -3874,6 +4075,149 @@ def log_personal_statistics(n_clicks):
             html.Br(),
             f"Failed to save statistics: {str(e)}"
         ], color="danger", dismissable=True)
+
+# Feedback system callbacks
+@app.callback(
+    [Output('feedback-modal', 'is_open'),
+     Output('feedback-data', 'children'),
+     Output('feedback-status', 'children'),
+     Output('feedback-global-status', 'children')],
+    [Input({'type': 'share-button', 'index': ALL}, 'n_clicks'),
+     Input('cancel-feedback-button', 'n_clicks'),
+     Input('submit-feedback-button', 'n_clicks')],
+    [State('feedback-modal', 'is_open'),
+     State('feedback-comment', 'value'),
+     State('chat-messages', 'children'),
+     State('feedback-data', 'children')],
+    prevent_initial_call=True
+)
+def handle_feedback_modal(share_clicks, cancel_clicks, submit_clicks, is_open, comment, messages_json, feedback_data_str):
+    """Handle opening/closing feedback modal and collecting feedback data"""
+    ctx = callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    trigger_id = ctx.triggered[0]['prop_id']
+    
+    # Handle share button clicks
+    if 'share-button' in trigger_id and any(share_clicks):
+        # Extract the clicked button ID from the trigger
+        try:
+            import ast
+            triggered_prop = ctx.triggered[0]['prop_id']
+            # Parse the triggered prop to get the index value
+            clicked_msg_id = None
+            if '{"index":"' in triggered_prop:
+                start_idx = triggered_prop.find('{"index":"') + len('{"index":"')
+                end_idx = triggered_prop.find('"', start_idx)
+                clicked_msg_id = triggered_prop[start_idx:end_idx]
+            
+            if clicked_msg_id:
+                # Store message data for feedback
+                try:
+                    messages = json.loads(messages_json) if messages_json else []
+                    
+                    # Find the assistant message that matches the clicked button's msg_id
+                    clicked_message = None
+                    for msg in messages:
+                        if msg['role'] == 'assistant':
+                            msg_id = f"msg_{hash(msg['content'] + msg['timestamp'])}"
+                            if msg_id == clicked_msg_id:
+                                clicked_message = msg
+                                break
+                    
+                    if clicked_message:
+                        # Store the clicked message data in a format the modal can access
+                        feedback_data = {
+                            'message_content': clicked_message['content'],
+                            'message_timestamp': clicked_message['timestamp'],
+                            'user_query': session_data.get('last_user_query', 'Unknown query'),
+                            'retrieved_chunks': session_data.get('last_retrieved_chunks', None)
+                        }
+                        
+                        return True, json.dumps(feedback_data), "", ""
+                    else:
+                        error_alert = dbc.Alert("Could not find the selected message. Please try again.", color="warning", dismissable=True)
+                        return True, "", error_alert, ""
+                        
+                except Exception as e:
+                    print(f"Error collecting feedback data: {str(e)}")
+                    error_alert = dbc.Alert("Error collecting message data. Please try again.", color="danger", dismissable=True)
+                    return True, json.dumps({'error': 'Failed to collect message data'}), error_alert, ""
+        except Exception as e:
+            print(f"Error parsing share button click: {str(e)}")
+            error_alert = dbc.Alert("Error processing share button click. Please try again.", color="danger", dismissable=True)
+            return True, "", error_alert, ""
+        
+        return True, "", "", ""
+    
+    # Handle cancel button
+    elif 'cancel-feedback-button' in trigger_id:
+        return False, "", "", ""
+    
+    # Handle submit button
+    elif 'submit-feedback-button' in trigger_id:
+        if comment and comment.strip():
+            try:
+                # Use the feedback data from state
+                if feedback_data_str:
+                    feedback_data = json.loads(feedback_data_str)
+                    
+                    # Collect comprehensive feedback information
+                    feedback_text = collect_feedback_information(
+                        user_query=feedback_data.get('user_query', 'Unknown query'),
+                        llm_response=feedback_data.get('message_content', 'Unknown response'),
+                        user_comment=comment.strip(),
+                        retrieved_chunks=feedback_data.get('retrieved_chunks')
+                    )
+                    
+                    # Save feedback to file
+                    filepath = save_feedback_to_file(feedback_text)
+                    
+                    if filepath:
+                        print(f"Feedback saved to: {filepath}")
+                        personal_stats.track_button_click('feedback_submitted')
+                        # Show success message in global status area (outside modal)
+                        success_alert = dbc.Alert([
+                            html.Strong("Feedback Saved Successfully!"),
+                            html.Br(),
+                            f"Your feedback has been saved to: {os.path.basename(filepath)}",
+                            html.Br(),
+                            html.Small("Send feedback to konradas.m@8devices.com. Thank you for helping improve the system!", className="text-muted")
+                        ], color="success", dismissable=True)
+                        return False, "", "", success_alert
+                    else:
+                        print("Failed to save feedback")
+                        personal_stats.track_error('feedback_errors')
+                        error_alert = dbc.Alert("Failed to save feedback. Please check the logs.", color="danger", dismissable=True)
+                        return True, feedback_data_str, error_alert, ""
+                else:
+                    error_alert = dbc.Alert("No feedback data available. Please try again.", color="danger", dismissable=True)
+                    return True, "", error_alert, ""
+                
+            except Exception as e:
+                print(f"Error submitting feedback: {str(e)}")
+                personal_stats.track_error('feedback_errors')
+                error_alert = dbc.Alert(f"Error submitting feedback: {str(e)}", color="danger", dismissable=True)
+                return True, feedback_data_str, error_alert, ""
+        else:
+            # Show error if no comment provided
+            error_alert = dbc.Alert("Please provide a comment before submitting feedback.", color="warning", dismissable=True)
+            return True, feedback_data_str, error_alert, ""
+    
+    raise PreventUpdate
+
+@app.callback(
+    [Output('feedback-comment', 'value'),
+     Output('feedback-status', 'children', allow_duplicate=True)],
+    Input('feedback-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def clear_feedback_comment(is_open):
+    """Clear the feedback comment and status when modal opens"""
+    if is_open:
+        return "", ""
+    raise PreventUpdate
 
 # Port Management System
 class PortManager:

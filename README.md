@@ -285,7 +285,16 @@ This project is in active development. For feedback and contributions, contact: 
 
 ## Changelog
 
-### v0.5.0 (Current)
+### v0.5.1 (Current)
+- **NEW**: Response feedback system where user can share feedback about the response
+- **NEW**: Feedback system automatically collects user query, LLM response, current RAG configuration, documents in project, embedding status, retrieved chunks
+- **IMPROVED**: Removed docs_md directory from project structure
+- **IMPROVED**: Removed storage of .pdf full texts in session data
+- **FIXED**: Fixed issue where documents were being double-processed because of remnants of docs_md directory
+- **FIXED**: Gemini conversation history now works in multi-turn mode
+- **FIXED**: Fixed 'Clear chat' button
+
+### v0.5.0
 - **NEW**: Page-aware chunking with page numbers
 - **NEW**: embed_page_aware_documents() method for processing page chunk objects
 - **NEW**: Backward compatibility with original embed_documents() method
