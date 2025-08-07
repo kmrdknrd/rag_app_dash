@@ -5,3 +5,9 @@
 /__pycache__
 .DS_Store
 app_log.txt
+/utils/__pycache__
+/ui/__pycache__
+/models/__pycache__
+/feedback
+/config/__pycache__
+/callbacks/__pycache__
